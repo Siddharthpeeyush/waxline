@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- waxline build 20261007-1620-youtube-full-tracks -->
+<!-- waxline build 20261007-1630-octave-account -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -595,7 +595,7 @@ const withAlbumCover = (t, a) => mapTrack({ ...t, album: t.album || { id: a.id, 
 const Api = {
   live: () => !LS.get('demo', false),
   cache: new Map(),
-  invalidate(){ this.cache.clear(); },
+  invalidate(){ this.cache.clear(); try{ localStorage.removeItem('waxline.home'); }catch(e){} },
   streamUrl(t){ return t.stream; },
   async home(){
     if(!this.live()) return DEMO.home();
@@ -923,6 +923,16 @@ const Player = {
     });
     el.addEventListener('error', ()=>{
       if(!this.track) return;
+      // native Octave stream failed (bad/expired token) → fall back to YouTube
+      if(this.mode==='native'){
+        const t = this.track;
+        this._nativeTok = null; this._nativeExp = 0;
+        t._nativeFailed = true;
+        this.mode = 'yt';
+        toast('Octave stream failed — trying YouTube');
+        this.load(this._ytPlaying || !el.paused);
+        return;
+      }
       if(this.audio.crossOrigin && this._retry !== this.track.id){
         // stream refused CORS: if the graph is attached we must swap to a clean
         // element, otherwise a tainted MediaElementSource would output silence
@@ -963,6 +973,17 @@ const Player = {
     this.ctxName = ctxName;
     this.load(true);
   },
+  async nativeToken(){
+    if(this._nativeTok && Date.now() < this._nativeExp) return this._nativeTok;
+    const key = LS.get('octave_key','');
+    if(!key) return null;
+    const r = await fetch('/octave/token', { headers: { 'x-octave-key': key } });
+    if(!r.ok){ if(r.status===403) toast('Octave key rejected — check Settings'); return null; }
+    const d = await r.json();
+    this._nativeTok = d.token;
+    this._nativeExp = Date.now() + (d.expiresIn || 3600)*1000 - 60000;
+    return this._nativeTok;
+  },
   async load(autoplay){
     const t = this.track; if(!t) return;
     this._retry = null;
@@ -971,6 +992,22 @@ const Player = {
     Store.pushRecent(t);
     paintTrack(); paintQueue(); paintRows(); paintPlay();
     try{ this.audio.pause(); }catch(e){}
+    // 1) native full-track audio via the user's Octave account (if a key is saved)
+    const key = LS.get('octave_key','');
+    if(key && !t._nativeFailed){
+      let tok = null;
+      try{ tok = await this.nativeToken(); }catch(e){ tok = null; }
+      if(this.track!==t || my!==this._loadToken) return;
+      if(tok){
+        this.mode = 'native';
+        this.audio.src = `/octave/stream/${tok}/HIGH?track=${encodeURIComponent(unDz(t.id))}`;
+        this.audio.load();
+        if(autoplay) this.play();
+        return;
+      }
+      // token failed → fall through to YouTube
+    }
+    // 2) YouTube full track
     let ytid = null;
     try{ ytid = await ytIdFor(t); }catch(e){ ytid = null; }
     if(this.track!==t || my!==this._loadToken) return; // user moved on
@@ -1522,12 +1559,20 @@ function openNewPlaylist(pendingTrack, existing){
 }
 function openSettings(){
   const demo = LS.get('demo', false);
+  const okey = LS.get('octave_key', '');
   openModal(`<span class="kicker">Settings</span><h3>Music backend</h3>
     <div class="ep-list" style="margin-top:6px">
       <b>Octave API</b> — built in, always on.<br>
       Live search, albums, artists and playlists.<br>
       Playback is full-length via YouTube. Likes and your<br>
       playlists stay in this browser.
+    </div>
+    <div style="margin-top:18px">
+      <label class="micro" for="stOKey" style="display:block;margin-bottom:6px">Octave account key (optional — native full tracks)</label>
+      <input id="stOKey" type="password" value="${esc(okey)}" placeholder="Paste your Octave account key"
+        style="width:100%;background:#0f0c0a;border:1px solid #3a2f28;color:#efe6d8;border-radius:5px;padding:10px 12px;font-size:13px" autocomplete="off" spellcheck="false">
+      <div class="micro" style="margin-top:6px;color:#a08c6f">From music.octavestreaming.com → F12 → Application → Local Storage → <b>octave:account</b> → copy the <b>key</b> value. Stored only in this browser, never uploaded.</div>
+      ${okey ? '<button class="btn" id="stOKeyClear" style="margin-top:8px">Remove key</button>' : ''}
     </div>
     <label style="display:flex;gap:10px;align-items:center;margin-top:18px;cursor:pointer">
       <input type="checkbox" id="stAnalyze" ${cfg.analyze?'checked':''} style="width:auto">
@@ -1537,6 +1582,14 @@ function openSettings(){
       <button class="btn" id="stDemo">${demo ? 'Use live backend' : 'Use demo catalogue'}</button>
       <button class="btn primary" id="stSave">Done</button></div>`);
   $('#stAnalyze').onchange = (e)=>{ cfg.analyze = e.target.checked; LS.set('api.analyze', cfg.analyze); };
+  $('#stOKey').onchange = (e)=>{
+    const v = e.target.value.trim();
+    LS.set('octave_key', v);
+    Player._nativeTok = null; Player._nativeExp = 0;
+    if(v) toast('Octave key saved — native full tracks enabled');
+  };
+  const clr = $('#stOKeyClear');
+  if(clr) clr.onclick = ()=>{ LS.set('octave_key',''); Player._nativeTok = null; openSettings(); toast('Octave key removed'); };
   $('#stDemo').onclick = ()=>{
     const nowDemo = !LS.get('demo', false);
     LS.set('demo', nowDemo);
