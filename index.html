@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- waxline build 20261007-1155-rebuild-hardened -->
+<!-- waxline build 20261007-1605-speed-cache -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -596,14 +596,24 @@ const Api = {
   streamUrl(t){ return t.stream; },
   async home(){
     if(!this.live()) return DEMO.home();
+    // instant repeat loads: cache the home payload for 1 hour
+    try{
+      const raw = localStorage.getItem('waxline.home');
+      if(raw){
+        const c = JSON.parse(raw);
+        if(c && Date.now() - c.at < 3600000 && c.data) return c.data;
+      }
+    }catch(e){}
     const s = await this.search('top hits');
-    return {
+    const data = {
       featured: s.albums[0] || null,
       newReleases: s.albums.slice(0, 12),
       artists: s.artists.slice(0, 12),
       playlists: s.playlists.slice(0, 8),
       topTracks: s.tracks.slice(0, 15),
     };
+    try{ localStorage.setItem('waxline.home', JSON.stringify({ at: Date.now(), data })); }catch(e){}
+    return data;
   },
   async search(q){
     if(!this.live()) return DEMO.search(q);
