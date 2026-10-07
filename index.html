@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- waxline build 20261007-1605-speed-cache -->
+<!-- waxline build 20261007-1620-youtube-full-tracks -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -400,6 +400,8 @@ setTimeout(function(){
   </div>
 </div>
 
+<!-- hidden YouTube player for full-track playback -->
+<div id="ytplayer" style="position:fixed;width:2px;height:2px;left:-10px;bottom:-10px;opacity:0;pointer-events:none" aria-hidden="true"></div>
 <!-- ============ PLAYER BAR ============ -->
 <footer id="playerbar">
   <div class="pb-left">
@@ -562,7 +564,8 @@ const mapTrack = (t) => ({
   albumId: t.album?.id != null ? dz(t.album.id) : '',
   cover: t.album?.cover_medium || t.album?.cover_small || '',
   duration: Number(t.duration) || 0,
-  stream: (typeof t.preview === 'string' && t.preview) ? t.preview : '',
+  // resolved fresh at play time via the edge function (preview URLs expire)
+  stream: '/octave/audio/' + dz(t.id),
 });
 const mapAlbum = (a) => ({
   id: dz(a.id),
@@ -792,19 +795,115 @@ const LocalPl = {
 };
 
 /* ================================================================
-   5 · PLAYER ENGINE
+   5 · PLAYER ENGINE — YouTube for full tracks, <audio> 30s fallback
    ================================================================ */
+async function ytIdFor(t){
+  if(t.ytId) return t.ytId;
+  if(!t._ytP){
+    t._ytP = (async ()=>{
+      const q = `${t.artist||''} - ${t.title||''}`.replace(/\s+/g,' ').trim();
+      if(!q || q==='-') return null;
+      const r = await fetch('/octave/yt/search?q='+encodeURIComponent(q));
+      if(!r.ok) return null;
+      const d = await r.json();
+      if(d && d.id){ t.ytId = d.id; if(d.duration) t.duration = d.duration; return d.id; }
+      return null;
+    })().catch(()=>null);
+  }
+  return t._ytP;
+}
+window.onYouTubeIframeAPIReady = function(){
+  try{
+    new YT.Player('ytplayer', {
+      width: '2', height: '2',
+      playerVars: { autoplay: 0, controls: 0, disablekb: 1, rel: 0, iv_load_policy: 3 },
+      events: {
+        onReady: e => Player.ytOnReady(e.target),
+        onStateChange: e => Player.ytOnState(e.data),
+        onError: () => Player.ytOnError(),
+      }
+    });
+  }catch(e){ /* YouTube unavailable — the 30s preview fallback covers it */ }
+};
 const Player = {
   audio:null, actx:null, analyser:null, freq:null, graphOk:false,
   visMode: cfg.analyze ? 'try' : 'off',
+  mode:'yt', yt:null, ytReady:false, _ytResolvers:[],
+  _ytPlaying:false, _ytTime:0, _ytDur:0, _loadToken:0,
   list:[], base:[], pos:-1, ctxName:'', shuffle:false, repeat: LS.get('repeat','off'),
   get track(){ return this.pos>=0 ? this.list[this.pos] : null; },
-  get playing(){ return this.audio && !this.audio.paused && !this.audio.ended; },
+  get playing(){
+    if(this.mode==='yt') return this._ytPlaying;
+    return this.audio && !this.audio.paused && !this.audio.ended;
+  },
+  curTime(){
+    if(this.mode==='yt' && this.ytReady) return this._ytTime||0;
+    return this.audio ? this.audio.currentTime : 0;
+  },
+  dur(){
+    if(this.mode==='yt' && this.ytReady && this._ytDur>0) return this._ytDur;
+    return (this.audio && isFinite(this.audio.duration) && this.audio.duration) || (this.track?this.track.duration:0) || 0;
+  },
+  setVolume(v){
+    v = Math.max(0, Math.min(1, v));
+    this.audio.volume = v; this.audio.muted = false;
+    if(this.ytReady && this.yt){ try{ this.yt.setVolume(Math.round(v*100)); this.yt.unMute(); }catch(e){} }
+    LS.set('volume', v); paintVolIcon();
+  },
 
   init(){
     this.bind(new Audio());
-    this.audio.volume = LS.get('volume', .8);
-    $('#vol').value = Math.round(this.audio.volume*100);
+    const v = LS.get('volume', .8);
+    this.audio.volume = v;
+    $('#vol').value = Math.round(v*100);
+    // poll the YouTube clock (the iframe API has no timeupdate event)
+    setInterval(()=>{
+      if(this.mode==='yt' && this.ytReady && this.yt){
+        try{
+          this._ytTime = this.yt.getCurrentTime()||0;
+          const d = this.yt.getDuration()||0;
+          if(d>0){ this._ytDur = d; if(this.track) this.track.duration = d; }
+        }catch(e){}
+        paintTime();
+      }
+    }, 500);
+  },
+  ytEnsure(){
+    return new Promise((resolve)=>{
+      if(this.ytReady && this.yt) return resolve(this.yt);
+      this._ytResolvers.push(resolve);
+      if(!window.__ytApiLoading){
+        window.__ytApiLoading = true;
+        const tag = document.createElement('script');
+        tag.src = 'https://www.youtube.com/iframe_api';
+        tag.onerror = ()=>{ this._ytResolvers.forEach(r=>r(null)); this._ytResolvers=[]; };
+        document.head.appendChild(tag);
+        setTimeout(()=>{ if(!this.ytReady){ this._ytResolvers.forEach(r=>r(null)); this._ytResolvers=[]; } }, 12000);
+      }
+    });
+  },
+  ytOnReady(p){
+    this.yt = p; this.ytReady = true;
+    try{ p.setVolume(Math.round(LS.get('volume',.8)*100)); }catch(e){}
+    this._ytResolvers.forEach(r=>r(p)); this._ytResolvers=[];
+  },
+  ytOnState(s){
+    if(s===1){ this._ytPlaying = true; paintPlay(); }
+    else if(s===2){ this._ytPlaying = false; paintPlay(); }
+    else if(s===0){
+      this._ytPlaying = false; paintPlay();
+      if(this.repeat==='one' && this.yt){ try{ this.yt.seekTo(0,true); this.yt.playVideo(); return; }catch(e){} }
+      this.next(true);
+    }
+  },
+  ytOnError(){
+    // YouTube blocked this video (embed restricted etc.) → 30s preview fallback
+    const t = this.track;
+    if(t){ t.ytId = null; t._ytP = Promise.resolve(null); }
+    this.mode = 'audio'; this._ytPlaying = false;
+    if(t){ this.audio.src = Api.streamUrl(t); this.audio.load(); this.audio.play().catch(()=>{}); }
+    toast('YouTube blocked this one — 30s preview');
+    paintPlay(); paintTime();
   },
   bind(el){
     this.audio = el;
@@ -864,35 +963,67 @@ const Player = {
     this.ctxName = ctxName;
     this.load(true);
   },
-  load(autoplay){
+  async load(autoplay){
     const t = this.track; if(!t) return;
     this._retry = null;
+    const my = ++this._loadToken;
+    this._ytPlaying = false;
+    Store.pushRecent(t);
+    paintTrack(); paintQueue(); paintRows(); paintPlay();
+    try{ this.audio.pause(); }catch(e){}
+    let ytid = null;
+    try{ ytid = await ytIdFor(t); }catch(e){ ytid = null; }
+    if(this.track!==t || my!==this._loadToken) return; // user moved on
+    if(ytid){
+      const p = await this.ytEnsure();
+      if(this.track!==t || my!==this._loadToken) return;
+      if(p){
+        this.mode = 'yt'; this.visMode = 'off';
+        try{
+          if(autoplay) p.loadVideoById(ytid);
+          else p.cueVideoById(ytid);
+          return; // YouTube is handling playback now
+        }catch(e){ /* fall through to preview */ }
+      }
+    }
+    // fallback: 30-second preview via <audio>
+    this.mode = 'audio';
     if(this.visMode!=='off'){ this.audio.crossOrigin = 'anonymous'; }
     else this.audio.removeAttribute('crossorigin');
     this.audio.src = Api.streamUrl(t);
     this.audio.load();
     if(autoplay) this.play();
-    Store.pushRecent(t);
-    paintTrack(); paintQueue(); paintRows();
   },
   play(){
     if(!this.track){ const r = Store.recent; if(r.length) this.playContext(r,0,'Recently played'); return; }
+    if(this.mode==='yt'){
+      if(this.ytReady && this.yt){ try{ this.yt.playVideo(); }catch(e){} }
+      return;
+    }
     if(this.actx && this.actx.state==='suspended') this.actx.resume();
     this.audio.play().catch(()=> toast('Playback blocked — press play'));
   },
-  pause(){ this.audio && this.audio.pause(); },
+  pause(){
+    if(this.mode==='yt'){ if(this.ytReady && this.yt){ try{ this.yt.pauseVideo(); }catch(e){} } return; }
+    this.audio && this.audio.pause();
+  },
   toggle(){ this.playing ? this.pause() : this.play(); },
   next(auto){
     if(this.pos+1 < this.list.length){ this.pos++; this.load(true); return; }
     if(this.repeat==='all' && this.list.length){ this.pos=0; this.load(true); return; }
-    if(auto){ this.pause(); this.audio.currentTime=0; paintTime(); }
+    if(auto){ this.pause(); this._ytTime = 0; try{ this.audio.currentTime=0; }catch(e){} paintTime(); }
   },
   prev(){
     if(!this.track) return;
-    if(this.audio.currentTime>3){ this.audio.currentTime=0; return; }
+    if(this.curTime()>3){
+      if(this.mode==='yt' && this.ytReady){ try{ this.yt.seekTo(0,true); }catch(e){} }
+      else { try{ this.audio.currentTime=0; }catch(e){} }
+      return;
+    }
     if(this.pos>0){ this.pos--; this.load(true); }
     else if(this.repeat==='all'){ this.pos=this.list.length-1; this.load(true); }
-    else this.audio.currentTime=0;
+    else if(this.mode==='yt' && this.ytReady){ try{ this.yt.seekTo(0,true); }catch(e){} }
+    else { try{ this.audio.currentTime=0; }catch(e){} }
   },
   jumpTo(i){ if(i>=0 && i<this.list.length){ this.pos=i; this.load(true); } },
   playNext(t){
@@ -932,8 +1063,10 @@ const Player = {
   },
   seekFrac(f){
     if(!this.track) return;
-    const d = this.audio.duration || this.track.duration || 0;
-    this.audio.currentTime = Math.max(0, Math.min(1,f)) * d;
+    const d = this.dur();
+    const sec = Math.max(0, Math.min(1,f)) * d;
+    if(this.mode==='yt' && this.ytReady){ try{ this.yt.seekTo(sec, true); }catch(e){} }
+    else { try{ this.audio.currentTime = sec; }catch(e){} }
     paintTime();
   }
 };
@@ -995,8 +1128,8 @@ function paintModes(){
 let dragFrac = null;
 function paintTime(){
   const t = Player.track;
-  const dur = (Player.audio && isFinite(Player.audio.duration) && Player.audio.duration) || (t?t.duration:0) || 0;
-  const cur = dragFrac!==null ? dragFrac*dur : (Player.audio ? Player.audio.currentTime : 0);
+  const dur = Player.dur();
+  const cur = dragFrac!==null ? dragFrac*dur : Player.curTime();
   const f = dur ? cur/dur : 0;
   $$('.seek-fill').forEach(el=> el.style.width = (f*100)+'%');
   $$('.seek-head').forEach(el=> el.style.left = (f*100)+'%');
@@ -1393,7 +1526,7 @@ function openSettings(){
     <div class="ep-list" style="margin-top:6px">
       <b>Octave API</b> — built in, always on.<br>
       Live search, albums, artists and playlists.<br>
-      Playback is 30-second previews. Likes and your<br>
+      Playback is full-length via YouTube. Likes and your<br>
       playlists stay in this browser.
     </div>
     <label style="display:flex;gap:10px;align-items:center;margin-top:18px;cursor:pointer">
@@ -1484,7 +1617,14 @@ document.addEventListener('click', e=>{
   if(act==='repeat') Player.cycleRepeat();
   if(act==='queue') $('#qp').classList.toggle('open');
   if(act==='expand') $('#np').classList.toggle('open');
-  if(act==='mute'){ Player.audio.muted = !Player.audio.muted; paintVolIcon(); }
+  if(act==='mute'){
+    if(Player.mode==='yt' && Player.ytReady && Player.yt){
+      try{ Player.yt.isMuted() ? Player.yt.unMute() : Player.yt.mute(); }catch(e){}
+    } else {
+      Player.audio.muted = !Player.audio.muted;
+    }
+    paintVolIcon();
+  }
   if(act==='like' && Player.track){
     Store.like(Player.track); Api.toggleLike(Player.track, Store.likes.has(Player.track.id));
     toast(Store.likes.has(Player.track.id)?'Liked — '+Player.track.title:'Removed — '+Player.track.title);
@@ -1492,12 +1632,16 @@ document.addEventListener('click', e=>{
   }
 });
 function paintVolIcon(){
-  const v = Player.audio.muted ? 0 : Player.audio.volume;
+  let v;
+  if(Player.mode==='yt' && Player.ytReady && Player.yt){
+    try{ v = Player.yt.isMuted() ? 0 : Player.yt.getVolume()/100; }catch(e){ v = Player.audio.volume; }
+  } else {
+    v = Player.audio.muted ? 0 : Player.audio.volume;
+  }
   setIcon($('[data-act="mute"]'), v===0?'volume-x':v>.5?'volume-2':'volume-1');
 }
 $('#vol').addEventListener('input', e=>{
-  Player.audio.volume = e.target.value/100; Player.audio.muted = false;
-  LS.set('volume', Player.audio.volume); paintVolIcon();
+  Player.setVolume(e.target.value/100);
 });
 
 /* seek bars */
@@ -1559,8 +1703,8 @@ window.addEventListener('keydown', e=>{
   if(tag==='input'||tag==='textarea') return;
   switch(e.key){
     case ' ': e.preventDefault(); if(!e.repeat) Player.toggle(); break;
-    case 'ArrowRight': e.preventDefault(); Player.seekFrac((Player.audio.currentTime+5)/((Player.audio.duration)||1)); break;
-    case 'ArrowLeft': e.preventDefault(); Player.seekFrac((Player.audio.currentTime-5)/((Player.audio.duration)||1)); break;
+    case 'ArrowRight': e.preventDefault(); Player.seekFrac((Player.curTime()+5)/((Player.dur())||1)); break;
+    case 'ArrowLeft': e.preventDefault(); Player.seekFrac((Player.curTime()-5)/((Player.dur())||1)); break;
     case 'n': case 'N': Player.next(); break;
     case 'p': case 'P': Player.prev(); break;
     case 's': case 'S': Player.toggleShuffle(); break;
@@ -1644,7 +1788,7 @@ paintMode(); paintModes(); paintQueue(); paintVolIcon(); sizeNp();
 route();
 bootIcons();
 requestAnimationFrame(raf);
-setTimeout(()=> toast(Api.live() ? 'Live mode — Octave API (30s previews)' : 'Demo catalogue loaded'), 1200);
+setTimeout(()=> toast(Api.live() ? 'Full tracks via YouTube' : 'Demo catalogue loaded'), 1200);
 </script>
 </body>
 </html>
