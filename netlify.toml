@@ -1,0 +1,8 @@
+# Waxline on Netlify — pure static + one edge function.
+# The player calls same-origin /octave/… paths; the edge function
+# (netlify/edge-functions/octave.js) proxies them to the Octave API
+# with a neutral User-Agent (the API blocks browser UAs and most
+# server IPs).
+
+[build]
+  publish = "."
