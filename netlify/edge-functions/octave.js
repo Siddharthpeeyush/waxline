@@ -62,7 +62,12 @@ export default async (request) => {
         headers,
         body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
     });
-    return res;
+    // Cache API responses on Netlify's CDN: catalogue data is near-static,
+    // so repeat visits (and repeat navigations) serve in milliseconds.
+    // The /octave/audio/ route above is never cached (fresh preview each play).
+    const out = new Response(res.body, res);
+    out.headers.set('Cache-Control', 'public, max-age=120, s-maxage=1800');
+    return out;
 };
 
 export const config = { path: '/octave/*' };
