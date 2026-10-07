@@ -50,6 +50,43 @@ export default async (request) => {
         return new Response('no preview available', { status: 404 });
     }
 
+    // YouTube search for full-track playback (via public Piped API instances).
+    // Returns the top video match: { id, title, duration }.
+    if (url.pathname.startsWith('/octave/yt/')) {
+        const q = url.searchParams.get('q') || '';
+        if (!q) return new Response('missing q', { status: 400 });
+        const instances = [
+            'https://api.piped.private.coffee',
+            'https://pipedapi.adminforge.de',
+        ];
+        for (const base of instances) {
+            try {
+                const r = await fetch(`${base}/search?q=${encodeURIComponent(q)}&filter=videos`, {
+                    headers: HEADERS,
+                });
+                if (!r.ok) continue;
+                const d = await r.json();
+                const items = (d.items || []).filter(
+                    (i) => i && typeof i.url === 'string' && i.url.startsWith('/watch?v=')
+                );
+                if (items.length) {
+                    const v = items[0];
+                    return Response.json(
+                        {
+                            id: v.url.slice(9),
+                            title: v.title || '',
+                            duration: Number(v.duration) || 0,
+                        },
+                        { headers: { 'Cache-Control': 'public, max-age=86400' } }
+                    );
+                }
+            } catch (e) {
+                /* try next instance */
+            }
+        }
+        return new Response('no video found', { status: 404 });
+    }
+
     const target = API + url.pathname.replace(/^\/octave/, '') + url.search;
 
     const headers = new Headers(request.headers);
