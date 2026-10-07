@@ -13,6 +13,19 @@
 const API = 'https://api.octavestreaming.com';
 const HEADERS = { 'user-agent': 'Waxline/1.0' };
 
+/** Get a playback token for full-track audio using the user's Octave account key. */
+async function playbackToken(accountKey) {
+    try {
+        const r = await fetch(`${API}/api/playback-token`, {
+            headers: { ...HEADERS, Authorization: `Bearer ${accountKey}` },
+        });
+        if (!r.ok) return null;
+        const d = await r.json();
+        return d.token || null;
+    } catch (e) {
+        return null;
+    }
+}
 /** Preview signatures expire; return a preview valid for 2+ minutes. */
 async function freshPreview(id) {
     const usable = (pv) => {
@@ -42,6 +55,49 @@ async function freshPreview(id) {
 
 export default async (request) => {
     const url = new URL(request.url);
+
+    // Exchange the user's Octave account key for a short-lived playback
+    // token (~1h). The account key arrives in a header (never in a URL or
+    // the repo); only the short-lived token is ever placed in a URL.
+    if (url.pathname === '/octave/token') {
+        const key = request.headers.get('x-octave-key');
+        if (!key) return new Response('missing key', { status: 401 });
+        const token = await playbackToken(key);
+        if (!token) return new Response('invalid key', { status: 403 });
+        return Response.json(
+            { token, expiresIn: 3600 },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
+    // Stream full-track audio. The URL carries the short-lived playback
+    // token (not the account key). Range requests are forwarded for seeking.
+    if (url.pathname.startsWith('/octave/stream/')) {
+        const parts = url.pathname.replace(/^\/octave\/stream\//, '').split('/');
+        const token = parts[0],
+            quality = parts[1] || 'HIGH';
+        const trackId = url.searchParams.get('track');
+        if (!token || !trackId) return new Response('bad request', { status: 400 });
+        const range = request.headers.get('range');
+        const audio = await fetch(
+            `${API}/audio/${encodeURIComponent(quality)}?track=${encodeURIComponent(trackId)}`,
+            {
+                headers: {
+                    ...HEADERS,
+                    Authorization: `Bearer ${token}`,
+                    ...(range ? { Range: range } : {}),
+                },
+            }
+        );
+        if (!audio.ok) return new Response('audio unavailable', { status: audio.status });
+        const headers = new Headers();
+        ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach((h) => {
+            const v = audio.headers.get(h);
+            if (v) headers.set(h, v);
+        });
+        headers.set('Cache-Control', 'no-store');
+        return new Response(audio.body, { status: audio.status, headers });
+    }
 
     if (url.pathname.startsWith('/octave/audio/')) {
         const id = url.pathname.replace(/^\/octave\/audio\//, '').replace(/^dz/, '');
