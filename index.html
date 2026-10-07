@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- waxline build 20261007-1645-octave-audio-refresh -->
+<!-- waxline build 20261007-1155-rebuild-hardened -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -336,6 +336,38 @@ input[type=range]::-moz-range-thumb{width:10px;height:10px;background:var(--bone
 </style>
 </head>
 <body>
+<script>
+/* Waxline boot watchdog — if the main app script fails to parse or the
+   network stalls, show a recovery card instead of a dead page. */
+window.__waxBooted = false;
+setTimeout(function(){
+  if(window.__waxBooted || document.getElementById('bootwatch')) return;
+  var w = document.createElement('div');
+  w.id = 'bootwatch';
+  w.innerHTML =
+    '<div class="bw-card"><div class="bw-kicker">WAXLINE</div>' +
+    '<div class="bw-title">The press didn\u2019t start.</div>' +
+    '<p class="bw-sub">The app didn\u2019t finish loading — usually a stuck network request. Your connection may be blocking the music API.</p>' +
+    '<div class="bw-row"><button class="bw-btn" id="bwReload">Reload</button>' +
+    '<button class="bw-btn bw-ghost" id="bwDemo">Use demo mode</button></div></div>';
+  document.body.appendChild(w);
+  document.getElementById('bwReload').onclick = function(){ location.reload(); };
+  document.getElementById('bwDemo').onclick = function(){
+    try{ localStorage.setItem('waxline.demo', 'true'); }catch(e){}
+    location.reload();
+  };
+}, 15000);
+</script>
+<style>
+#bootwatch{position:fixed;inset:0;z-index:999;display:flex;align-items:center;justify-content:center;background:rgba(12,9,7,.94);padding:20px}
+.bw-card{max-width:420px;width:100%;background:#171310;border:1px solid #3a2f28;border-radius:8px;padding:30px 28px;text-align:center;color:#efe6d8;font-family:system-ui,-apple-system,sans-serif}
+.bw-kicker{font-size:10px;letter-spacing:.3em;color:#a08c6f;margin-bottom:12px}
+.bw-title{font-size:22px;font-weight:700;margin-bottom:10px}
+.bw-sub{font-size:14px;line-height:1.5;color:#b8a88f;margin:0 0 22px}
+.bw-row{display:flex;gap:10px;justify-content:center}
+.bw-btn{background:#e8b04b;color:#171310;border:none;border-radius:5px;padding:11px 22px;font-size:14px;font-weight:700;cursor:pointer}
+.bw-btn.bw-ghost{background:transparent;color:#e8b04b;border:1px solid #e8b04b}
+</style>
 
 <div id="app">
   <!-- ============ SIDEBAR ============ -->
@@ -509,10 +541,17 @@ const setIcon = (el,name) => { el.innerHTML = `<i data-lucide="${name}"></i>`; i
    ================================================================ */
 const dz = (id) => `dz${id}`;
 const unDz = (id) => String(id).replace(/^dz/, '');
-async function oget(path){
-  const r = await fetch('/octave' + path);
-  if(!r.ok) throw new Error(r.status + ' ' + r.statusText);
-  return r.json();
+async function oget(path, ms){
+  const ctl = new AbortController();
+  const timer = setTimeout(()=>ctl.abort(), ms || 15000);
+  try{
+    const r = await fetch('/octave' + path, { signal: ctl.signal });
+    if(!r.ok) throw new Error(r.status + ' ' + r.statusText);
+    return r.json();
+  }catch(e){
+    if(e && e.name==='AbortError') throw new Error('Request timed out — check your connection');
+    throw e;
+  }finally{ clearTimeout(timer); }
 }
 const mapTrack = (t) => ({
   id: dz(t.id),
@@ -1224,6 +1263,7 @@ async function route(){
     main.scrollTop = 0;
   }catch(err){ main.innerHTML = errbox(LABELS[view], err); }
   icons(); paintRows();
+  window.__waxBooted = true;
 }
 window.addEventListener('hashchange', route);
 
