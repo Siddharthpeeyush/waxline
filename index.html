@@ -667,14 +667,39 @@ const Api = {
   async search(q){
     if(!this.live()) return DEMO.search(q);
     const enc = encodeURIComponent(q);
-    const [tr, al, ar, pl] = await Promise.all([
+    // Search Gaana DIRECTLY first: its tracks already carry fresh
+    // signed HLS URLs, so tapping one plays that exact Gaana track
+    // with no Octave/Deezer match step at play time. Octave results
+    // are kept for albums/artists/playlists, and as the track
+    // fallback when Gaana has no title match (e.g. songs Gaana's
+    // search ranking buries — those still resolve via the slug
+    // resolver at play time, as before).
+    const [g, tr, al, ar, pl] = await Promise.all([
+      fetch('/octave/gaana-search?q=' + enc).then(r => r.ok ? r.json() : { tracks: [] }).catch(() => ({ tracks: [] })),
       oget(`/dz/search/track?q=${enc}&limit=12`).catch(() => ({ data: [] })),
       oget(`/dz/search/album?q=${enc}&limit=12`).catch(() => ({ data: [] })),
       oget(`/dz/search/artist?q=${enc}&limit=12`).catch(() => ({ data: [] })),
       oget(`/dz/search/playlist?q=${enc}&limit=12`).catch(() => ({ data: [] })),
     ]);
+    const gaanaTracks = (g.tracks || []).map(t => ({
+      id: t.id, title: t.title, artist: t.artist, artistId: '',
+      album: t.album, albumId: '', cover: t.cover, duration: t.duration,
+      stream: '', _gaana: t.gaana,
+    }));
+    // Merge, don't replace: Gaana's own search ranking buries some
+    // real recordings (Arijit's Kesariya, Queen's Bohemian Rhapsody)
+    // that Octave's catalogue lists first. Gaana tracks play
+    // instantly (URLs already attached); Octave tracks that aren't
+    // already listed (same title + artist + duration within 5s)
+    // are appended and resolve at play time via the slug resolver.
+    const octaveTracks = (tr.data || []).map(mapTrack);
+    const sameSong = (a, b) => a.title.toLowerCase() === b.title.toLowerCase()
+      && a.artist.toLowerCase() === b.artist.toLowerCase()
+      && Math.abs((a.duration || 0) - (b.duration || 0)) <= 5;
+    const merged = [...gaanaTracks];
+    for (const t of octaveTracks) if (!merged.some(m => sameSong(m, t))) merged.push(t);
     return {
-      tracks: (tr.data || []).map(mapTrack),
+      tracks: merged.length ? merged : octaveTracks,
       albums: (al.data || []).map(mapAlbum),
       artists: (ar.data || []).map(mapArtist),
       playlists: (pl.data || []).map(mapPlaylist),
@@ -889,21 +914,6 @@ function gaanaUrlFor(g, q){
 function paintQuality(){
   const cur = gaanaQuality();
   document.querySelectorAll('#npQBtns button').forEach(b=> b.classList.toggle('on', b.dataset.q===cur));
-}
-async function ytIdFor(t){
-  if(t.ytId) return t.ytId;
-  if(!t._ytP){
-    t._ytP = (async ()=>{
-      const q = `${t.artist||''} - ${t.title||''}`.replace(/\s+/g,' ').trim();
-      if(!q || q==='-') return null;
-      const r = await fetch('/octave/yt/search?q='+encodeURIComponent(q));
-      if(!r.ok) return null;
-      const d = await r.json();
-      if(d && d.id){ t.ytId = d.id; if(d.duration) t.duration = d.duration; return d.id; }
-      return null;
-    })().catch(()=>null);
-  }
-  return t._ytP;
 }
 window.onYouTubeIframeAPIReady = function(){
   try{
@@ -1494,11 +1504,11 @@ function vSearch(d, q){
   return `<div class="view">
     <div class="kicker" style="margin:8px 0 18px">Search — “${esc(q)}”</div>
     ${top ? `<div class="detail" style="padding-top:10px">
-      <div class="cover" data-nav="#/album/${top.albumId}" style="max-width:190px;cursor:pointer"><img src="${esc(top.cover)}" alt="" onerror="this.classList.add('dead')">
+      <div class="cover" ${top.albumId ? `data-nav="#/album/${top.albumId}"` : ''} style="max-width:190px;cursor:pointer"><img src="${esc(top.cover)}" alt="" onerror="this.classList.add('dead')">
         <button class="playfab" data-play="tracks" data-tk2="${regTracks(d.tracks)}" data-idx="0" style="width:48px;height:48px"><i data-lucide="play"></i></button></div>
       <div><span class="micro">Top result</span>
         <h1 style="font-size:clamp(28px,3.4vw,46px)">${esc(top.title)}</h1>
-        <div class="meta">Track · <a href="#/artist/${top.artistId}">${esc(top.artist)}</a> · ${fmt(top.duration)}</div>
+        <div class="meta">Track · ${top.artistId ? `<a href="#/artist/${top.artistId}">${esc(top.artist)}</a>` : esc(top.artist)} · ${fmt(top.duration)}</div>
         <div class="actions"><button class="pill" data-play="tracks" data-tk2="${regTracks(d.tracks)}" data-idx="0"><i data-lucide="play"></i>Play</button></div>
       </div></div>` : ''}
     ${d.tracks.length ? secHead('T1','Tracks') + trackRows(d.tracks,'Search — '+q,{albumCol:false}) : ''}
