@@ -659,7 +659,13 @@ const Api = {
     }catch(e){}
     let data = null;
     try{
-      const g = await fetch('/octave/gaana-home').then(r => r.ok ? r.json() : null);
+      // Cache-buster on every Gaana fetch: Netlify's CDN was serving
+      // stale cached 404/empty responses for /octave/gaana and
+      // /octave/gaana-search even though the edge sets no-store —
+      // a fresh query string defeats the CDN cache key, and these
+      // URLs are meant to be fresh on every call anyway (signed
+      // HLS URLs expire in ~4h).
+      const g = await fetch('/octave/gaana-home?cb=' + Date.now()).then(r => r.ok ? r.json() : null);
       if(g && g.topTracks && g.topTracks.length){
         const toTrack = t => ({
           id: t.id, title: t.title, artist: t.artist, artistId: '',
@@ -704,7 +710,7 @@ const Api = {
     // search ranking buries — those still resolve via the slug
     // resolver at play time, as before).
     const [g, tr, al, ar, pl] = await Promise.all([
-      fetch('/octave/gaana-search?q=' + enc).then(r => r.ok ? r.json() : { tracks: [] }).catch(() => ({ tracks: [] })),
+      fetch('/octave/gaana-search?q=' + enc + '&cb=' + Date.now()).then(r => r.ok ? r.json() : { tracks: [] }).catch(() => ({ tracks: [] })),
       oget(`/dz/search/track?q=${enc}&limit=12`).catch(() => ({ data: [] })),
       oget(`/dz/search/album?q=${enc}&limit=12`).catch(() => ({ data: [] })),
       oget(`/dz/search/artist?q=${enc}&limit=12`).catch(() => ({ data: [] })),
@@ -781,7 +787,7 @@ const Api = {
       // Gaana playlist (home "Just Arrived" shelf): tracks already
       // carry signed Gaana HLS URLs.
       const seokey = id.slice('ga-pl-'.length);
-      const p = await fetch('/octave/gaana-playlist?seokey=' + encodeURIComponent(seokey)).then(r => r.ok ? r.json() : null);
+      const p = await fetch('/octave/gaana-playlist?seokey=' + encodeURIComponent(seokey) + '&cb=' + Date.now()).then(r => r.ok ? r.json() : null);
       if(!p) throw new Error('Gaana playlist unavailable');
       return {
         id: p.id, title: p.name, curator: p.curator, description: 'Gaana · Just Arrived',
@@ -935,6 +941,7 @@ async function gaanaFor(t){
         q: `${t.title||''} ${t.artist||''}`.replace(/\s+/g,' ').trim(),
         dur: String(Math.round(t.duration||0)),
       });
+      params.set('cb', String(Date.now()));
       const r = await fetch('/octave/gaana?'+params.toString());
       if(!r.ok) return null;
       const d = await r.json();
