@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- waxline build 20261105-gaana-only -->
+<!-- waxline build 20261105-gaana-quality -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -323,6 +323,11 @@ input[type=range]::-moz-range-thumb{width:10px;height:10px;background:#fff;borde
 .np-album{font:400 11px/2.4 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--ink50)}
 #npCanvas{display:block;width:100%;height:110px;margin:28px 0 8px}
 .np-ctl{display:flex;align-items:center;gap:10px;margin-top:18px}
+.np-quality{display:flex;align-items:center;gap:10px;margin-top:18px;flex-wrap:wrap}
+.np-qbtns{display:flex;gap:6px}
+.np-qbtns button{border:1px solid var(--line2);background:transparent;color:var(--ink70);padding:8px 12px;font:400 10px/1 var(--mono);letter-spacing:.1em;border-radius:20px;cursor:pointer}
+.np-qbtns button:hover{border-color:var(--ink);color:var(--ink)}
+.np-qbtns button.on{background:var(--grad);border-color:transparent;color:#04060d;font-weight:700}
 .np-ctl .play-btn{width:52px;height:52px}
 .np-ctl .seek{max-width:none}
 .np-next{margin-top:26px}
@@ -504,6 +509,7 @@ setTimeout(function(){
         <button class="icon-btn dim" data-act="repeat" aria-label="Repeat"><i data-lucide="repeat"></i></button>
         <button class="icon-btn" data-act="like" aria-label="Like" style="margin-left:8px"><i data-lucide="heart"></i></button>
       </div>
+      <div class="np-quality"><span class="micro">Audio quality</span><div class="np-qbtns" id="npQBtns"><button data-q="64">64 kbps</button><button data-q="128">128 kbps</button><button data-q="320">320 kbps</button></div></div>
       <div class="np-next"><div class="micro" style="margin-bottom:6px">Next up</div><div id="npNext"></div></div>
     </div>
   </div>
@@ -865,6 +871,25 @@ async function gaanaFor(t){
   if(!res) t._gaanaP = null;
   return res;
 }
+// Gaana serves each quality as its own single-variant HLS master
+// (verified live: 64 ≈ 130 kbps, 128 ≈ 193 kbps, 320 ≈ 390 kbps),
+// so "quality" here means which master URL the player loads —
+// there is no multi-variant ABR to steer with hls.js.
+const GAANA_QS = ['64','128','320'];
+function gaanaQuality(){
+  const q = String(LS.get('gaana_quality','128'));
+  return GAANA_QS.includes(q) ? q : '128';
+}
+function gaanaUrlFor(g, q){
+  if(!g) return '';
+  if(q==='64') return g.stream_url_64 || g.stream_url;
+  if(q==='320') return g.stream_url_320 || g.stream_url;
+  return g.stream_url;
+}
+function paintQuality(){
+  const cur = gaanaQuality();
+  document.querySelectorAll('#npQBtns button').forEach(b=> b.classList.toggle('on', b.dataset.q===cur));
+}
 async function ytIdFor(t){
   if(t.ytId) return t.ytId;
   if(!t._ytP){
@@ -1041,6 +1066,27 @@ const Player = {
     toast('Gaana stream failed for this song');
     paintPlay(); paintTime();
   },
+  async setQuality(q){
+    if(!GAANA_QS.includes(q)) return;
+    LS.set('gaana_quality', q); paintQuality();
+    const t = this.track;
+    // Nothing playing yet: the choice is saved and used from the next track.
+    if(this.mode!=='gaana' || !t || !t._gaana) return;
+    const url = gaanaUrlFor(t._gaana, q);
+    if(!url || q===this._gaanaQ) return;
+    this._gaanaQ = q; this._gaanaDead = false;
+    const pos = this.curTime(), was = this.playing;
+    const ok = await this.loadGaana(url, false);
+    if(this.track!==t || q!==this._gaanaQ) return; // user moved on / changed again
+    if(!ok){ this.gaanaFatal(); return; }
+    const seek = ()=>{
+      try{ if(pos>0 && pos < this.dur()) this.audio.currentTime = pos; }catch(e){}
+      if(was) this.play();
+    };
+    if(this.audio.readyState>=1) seek();
+    else this.audio.addEventListener('loadedmetadata', seek, { once:true });
+    toast('Audio quality: ' + q + ' kbps');
+  },
   bind(el){
     this.audio = el;
     el.addEventListener('timeupdate', ()=> paintTime());
@@ -1146,8 +1192,9 @@ const Player = {
       this.mode = 'gaana';
       if(this.visMode!=='off'){ this.audio.crossOrigin = 'anonymous'; }
       else this.audio.removeAttribute('crossorigin');
+      const q = gaanaQuality(); this._gaanaQ = q; paintQuality();
       let ok = false;
-      try{ ok = await this.loadGaana(g.stream_url, autoplay); }catch(e){ ok = false; }
+      try{ ok = await this.loadGaana(gaanaUrlFor(g, q), autoplay); }catch(e){ ok = false; }
       if(this.track!==t || my!==this._loadToken) return;
       if(ok) return; // Gaana is handling playback now
       this.gaanaFatal();
@@ -1266,7 +1313,7 @@ function paintTrack(){
   $('#npFrom').textContent = Player.ctxName ? 'Playing from — ' + Player.ctxName : 'Now playing';
   $('#qpCtx').textContent = Player.ctxName;
   document.title = 'Waxline — ' + t.title;
-  paintLikes(); paintTime();
+  paintLikes(); paintQuality(); paintTime();
   if('mediaSession' in navigator){
     try{
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -1685,20 +1732,13 @@ function openNewPlaylist(pendingTrack, existing){
 }
 function openSettings(){
   const demo = LS.get('demo', false);
-  const okey = LS.get('octave_key', '');
   openModal(`<span class="kicker">Settings</span><h3>Music backend</h3>
     <div class="ep-list" style="margin-top:6px">
       <b>Octave API</b> — built in, always on.<br>
       Live search, albums, artists and playlists.<br>
-      Playback is full-length via YouTube. Likes and your<br>
-      playlists stay in this browser.
-    </div>
-    <div style="margin-top:18px">
-      <label class="micro" for="stOKey" style="display:block;margin-bottom:6px">Octave account key (optional — native full tracks)</label>
-      <input id="stOKey" type="password" value="${esc(okey)}" placeholder="Paste your Octave account key"
-        style="width:100%;background:#0f0c0a;border:1px solid #3a2f28;color:#efe6d8;border-radius:5px;padding:10px 12px;font-size:13px" autocomplete="off" spellcheck="false">
-      <div class="micro" style="margin-top:6px;color:#a08c6f">From music.octavestreaming.com → F12 → Application → Local Storage → <b>octave:account</b> → copy the <b>key</b> value. Stored only in this browser, never uploaded.</div>
-      ${okey ? '<button class="btn" id="stOKeyClear" style="margin-top:8px">Remove key</button>' : ''}
+      Playback is Gaana HLS only — pick 64, 128 or 320 kbps<br>
+      in Now Playing. Likes and your playlists stay in<br>
+      this browser.
     </div>
     <label style="display:flex;gap:10px;align-items:center;margin-top:18px;cursor:pointer">
       <input type="checkbox" id="stAnalyze" ${cfg.analyze?'checked':''} style="width:auto">
@@ -1708,14 +1748,6 @@ function openSettings(){
       <button class="btn" id="stDemo">${demo ? 'Use live backend' : 'Use demo catalogue'}</button>
       <button class="btn primary" id="stSave">Done</button></div>`);
   $('#stAnalyze').onchange = (e)=>{ cfg.analyze = e.target.checked; LS.set('api.analyze', cfg.analyze); };
-  $('#stOKey').onchange = (e)=>{
-    const v = e.target.value.trim();
-    LS.set('octave_key', v);
-    Player._nativeTok = null; Player._nativeExp = 0;
-    if(v) toast('Octave key saved — native full tracks enabled');
-  };
-  const clr = $('#stOKeyClear');
-  if(clr) clr.onclick = ()=>{ LS.set('octave_key',''); Player._nativeTok = null; openSettings(); toast('Octave key removed'); };
   $('#stDemo').onclick = ()=>{
     const nowDemo = !LS.get('demo', false);
     LS.set('demo', nowDemo);
@@ -1853,6 +1885,12 @@ $('#qpList').addEventListener('click', e=>{
 $('#npNext').addEventListener('click', e=>{
   const r = e.target.closest('[data-np]');
   if(r) Player.jumpTo(+r.dataset.np);
+});
+
+/* audio quality picker (Now Playing) */
+$('#npQBtns').addEventListener('click', e=>{
+  const b = e.target.closest('[data-q]');
+  if(b) Player.setQuality(b.dataset.q);
 });
 
 /* sidebar */
