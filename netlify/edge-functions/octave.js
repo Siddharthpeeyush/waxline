@@ -120,11 +120,20 @@ const gaanaTokens = (s) => new Set(gaanaNorm(s).split(' ').filter(Boolean));
 function gaanaScore(wantTitle, wantArtist, wantDur, cand) {
     const ct = gaanaNorm(cand.title);
     const wt = gaanaNorm(wantTitle);
+    const dur0 = Number(cand.duration) || 0;
+    const diff0 = wantDur > 0 && dur0 > 0 ? Math.abs(dur0 - wantDur) : null;
     let titleScore = 0;
     if (ct && wt) {
         if (ct === wt) titleScore = 100;
-        else if (ct.includes(wt) || wt.includes(ct)) titleScore = 85;
-        else {
+        else if (ct.includes(wt) || wt.includes(ct)) {
+            // Same-name versions: Gaana often suffixes the real version
+            // ("Tum Hi Ho (Remix By Dj Shadow...)") while the plain title
+            // is a different recording. If the duration also matches
+            // within 10s, the suffixed title IS the requested version —
+            // score it as exact, or the plain title (wrong recording,
+            // duration off by 20s+) wins on title alone.
+            titleScore = diff0 !== null && diff0 <= 10 ? 100 : 85;
+        } else {
             const a = gaanaTokens(wt),
                 b = gaanaTokens(ct);
             const common = [...a].filter((t) => b.has(t)).length;
@@ -207,31 +216,40 @@ function gaanaSlug(s) {
 
 /** Resolve a title+artist to Gaana's best matching track + HLS stream URL. */
 async function gaanaResolve(query, wantTitle, wantArtist, wantDur, wantAlbum) {
-    // Step 1 — search by TITLE ONLY: Gaana's search degrades badly with
-    // "title artist" phrases (it returned unrelated tracks for
-    // "Kesariya Arijit Singh", but correct results for "Kesariya").
-    // The artist is used for scoring, not for searching.
+    // Step 1 — search by TITLE ONLY, using ALL results, not just the
+    // top few: same-name versions live far down the ranking (the
+    // correct artist's cut is often at position 20+, while the most
+    // popular cut sits at the top). Every candidate is scored by
+    // exact artist + duration, so extra candidates can't steal the
+    // match — they only give the right version a chance to be found.
+    // Gaana's search degrades badly with "title artist" phrases for
+    // some songs, so that search runs as a second, separate pass and
+    // its candidates are scored the same way (garbage is rejected
+    // by the exact-artist gate, never returned).
     const keyword = wantTitle || query;
     let best = null;
-    try {
-        const search = await gaanaPost(
-            `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(keyword)}`
-        );
-        const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean).slice(0, 16);
-        if (seos.length) {
-            const details = await Promise.all(
-                seos.map((seo) =>
-                    gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
-                )
+    for (const kw of [keyword, wantTitle && wantArtist ? `${wantTitle} ${wantArtist}` : null].filter(Boolean)) {
+        try {
+            const search = await gaanaPost(
+                `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(kw)}`
             );
-            best = await gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, best);
+            const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean);
+            if (seos.length) {
+                const details = await Promise.all(
+                    seos.map((seo) =>
+                        gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
+                    )
+                );
+                best = await gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, best);
+            }
+        } catch (e) {
+            /* fall through to the next pass */
         }
-    } catch (e) {
-        /* fall through to slug lookup */
     }
-    // A near-perfect search hit (exact title + exact artist, duration
-    // within ~50s) is the right track — no need for more lookups.
-    if (best && best.score >= 140) return best;
+    // No early return here, on purpose: a good search hit (score 145,
+    // duration off by 25s) must not beat a slug hit that is the exact
+    // recording (score 150, duration exact). All passes run and the
+    // BEST score across every pass wins.
 
     // Step 2 — direct song-page slugs. Gaana's title search is a
     // ranking, not an index: it buries real tracks (it never listed
