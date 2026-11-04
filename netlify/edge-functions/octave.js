@@ -517,6 +517,35 @@ export default async (request) => {
         return Response.json(pl, { headers: { 'Cache-Control': 'no-store' } });
     }
 
+    // TEMPORARY DIAGNOSTIC (remove after debugging): reports what
+    // Gaana's API actually returns from Netlify's edge IP, because
+    // live gaana-search returns [] and live resolver fails for
+    // Pyaar Karte Ho Na while the same code succeeds from the VM.
+    if (url.pathname === '/octave/gaana-diag') {
+        const q = url.searchParams.get('q') || 'Tum Hi Ho';
+        const seo = url.searchParams.get('seo') || 'pyaar-karte-ho-na';
+        const search = await gaanaPost(
+            `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(q)}`
+        );
+        const detail = await gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`);
+        const dt = (detail?.tracks || [])[0] || null;
+        return Response.json(
+            {
+                searchOk: !!search,
+                searchGd: ((search?.gr?.[0]?.gd) || []).length,
+                searchFirstSeo: ((search?.gr?.[0]?.gd) || [])[0]?.seo || null,
+                searchKeys: search ? Object.keys(search) : [],
+                detailTracks: (detail?.tracks || []).length,
+                detailTitle: dt?.track_title || null,
+                detailArtists: (dt?.artist || []).map((a) => a.name),
+                detailDuration: dt?.duration || null,
+                detailHasMedium: !!dt?.urls?.medium?.message,
+                detailUrlKeys: dt?.urls ? Object.keys(dt.urls) : [],
+            },
+            { headers: { 'Cache-Control': 'no-store' } }
+        );
+    }
+
     // Gaana playback resolver: fresh signed HLS URL for a title+artist.
     // Never cached (the signature expires in ~4h).
     if (url.pathname === '/octave/gaana') {
