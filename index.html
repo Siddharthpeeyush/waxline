@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- waxline build 20261105-gaana-quality -->
+<!-- waxline build 20261105-playfix -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -1105,6 +1105,9 @@ const Player = {
     });
     el.addEventListener('error', ()=>{
       if(!this.track) return;
+      // Clearing the old stream during a track switch can fire a
+      // spurious error — ignore it, the new stream is on its way.
+      if(this._switching) return;
       // Gaana HLS failed → stop (Gaana only; no other source to fall back to)
       if(this.mode==='gaana'){
         this.gaanaFatal();
@@ -1181,7 +1184,13 @@ const Player = {
     try{ this.hls?.destroy(); }catch(e){}
     this.hls = null;
     this._gaanaDead = false;
-    try{ this.audio.pause(); }catch(e){}
+    // Hard reset the audio element: without this, a track switch
+    // left the OLD song's stream, timer and duration attached, so
+    // pressing Play after a failed lookup resumed the old song
+    // under the new song's title.
+    this._switching = true;
+    try{ this.audio.pause(); this.audio.removeAttribute('src'); this.audio.load(); this.audio.currentTime = 0; }catch(e){}
+    paintTime();
     // Gaana only — no Octave, YouTube or preview fallback.
     // If Gaana has no matching stream for this track, it simply
     // does not play (toast below) instead of switching sources.
@@ -1196,10 +1205,12 @@ const Player = {
       let ok = false;
       try{ ok = await this.loadGaana(gaanaUrlFor(g, q), autoplay); }catch(e){ ok = false; }
       if(this.track!==t || my!==this._loadToken) return;
+      this._switching = false;
       if(ok) return; // Gaana is handling playback now
       this.gaanaFatal();
       return;
     }
+    this._switching = false;
     this.mode = 'gaana';
     toast('No Gaana stream for this song');
     paintPlay(); paintTime();
@@ -1803,12 +1814,15 @@ $('#main').addEventListener('click', e=>{
   const nav = e.target.closest('[data-nav]');
   if(nav){ location.hash = nav.dataset.nav; return; }
   const row = e.target.closest('.trow');
-  if(row && !e.target.closest('a,button')){
-    const wrap = row.closest('[data-tk]');
-    const tracks = VT[wrap.dataset.tk];
-    const plId = location.hash.includes('/playlist/') ? location.hash.split('/').pop() : null;
-    Player.playContext(tracks, +row.dataset.i, wrap.dataset.ctx);
-    return;
+  if(row){
+    // The row's own play button was dead: the handler below excluded
+    // every button click, so tapping ▶ did nothing at all.
+    if(e.target.closest('.miniplay') || !e.target.closest('a,button')){
+      const wrap = row.closest('[data-tk]');
+      const tracks = VT[wrap.dataset.tk];
+      Player.playContext(tracks, +row.dataset.i, wrap.dataset.ctx);
+      return;
+    }
   }
   const top = e.target.closest('.toprow');
   if(top && !e.target.closest('button')){
