@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- waxline build 20261105-playfix -->
+<!-- waxline build 20261105-gaana-fetchfix -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -850,7 +850,7 @@ async function gaanaFor(t){
   if(!t._gaanaP){
     t._gaanaP = (async ()=>{
       const params = new URLSearchParams({
-        title: t.title||'', artist: t.artist||'',
+        title: t.title||'', artist: t.artist||'', album: t.album||'',
         q: `${t.title||''} ${t.artist||''}`.replace(/\s+/g,' ').trim(),
         dur: String(Math.round(t.duration||0)),
       });
