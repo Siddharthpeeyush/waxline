@@ -204,6 +204,85 @@ async function gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, bes
     return best;
 }
 
+/** Gaana-direct search: returns Waxline-shaped tracks with fresh
+ *  signed HLS URLs already attached (no second lookup at play time). */
+async function gaanaSearch(q) {
+    const want = gaanaTokens(q);
+    const out = [];
+    const seen = new Set();
+    const addTrack = async (t) => {
+        if (!t || !t.seokey || seen.has(t.seokey)) return;
+        const msg = t?.urls?.medium?.message;
+        if (!msg) return;
+        const base = await gaanaDecrypt(msg);
+        if (!base || !base.startsWith('https://')) return;
+        seen.add(t.seokey);
+        const artists = (t.artist || []).map((a) => a.name).filter(Boolean);
+        out.push({
+            id: 'ga' + t.seokey,
+            title: t.track_title || '',
+            artist: artists.join(', '),
+            album: t.album_title || '',
+            cover: t.artwork_web || t.artwork || '',
+            duration: Number(t.duration) || 0,
+            seokey: t.seokey,
+            gaana: {
+                title: t.track_title || '',
+                artist: artists.join(', '),
+                duration: Number(t.duration) || 0,
+                seokey: t.seokey,
+                stream_url_64: base,
+                stream_url: base.includes('64.mp4') ? base.replace('64.mp4', '128.mp4') : base,
+                stream_url_320: base.includes('64.mp4') ? base.replace('64.mp4', '320.mp4') : base,
+                source: 'gaana',
+            },
+        });
+    };
+    try {
+        const search = await gaanaPost(
+            `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(q)}`
+        );
+        const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean);
+        if (seos.length) {
+            const details = await Promise.all(
+                seos.map((seo) =>
+                    gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
+                )
+            );
+            const cands = [];
+            for (const d of details) {
+                for (const t of d?.tracks || []) {
+                    const titleTokens = gaanaTokens(t.track_title || '');
+                    const allWords = [...want].every((w) => titleTokens.has(w));
+                    if (!allWords) continue;
+                    const rank = gaanaNorm(t.track_title) === gaanaNorm(q) ? 0 : 1;
+                    cands.push({ t, rank });
+                }
+            }
+            cands.sort((a, b) => a.rank - b.rank);
+            for (const c of cands) await addTrack(c.t);
+        }
+    } catch (e) {
+        /* fall through to slug lookup */
+    }
+    // Always run the slug candidates too, and collect ALL of them:
+    // Gaana's search ranking buries the real recording (Queen's
+    // "Bohemian Rhapsody" lives at "bohemianrhapsody", Pawan Singh's
+    // "Mah Ke Dekha Dem" at "mah-ke-dekha-dem-1"), while the plain
+    // slug is a different cut. Stopping at the first slug hit would
+    // surface only the wrong cut.
+    const slug = gaanaSlug(q);
+    for (const seo of [...new Set([slug, slug.replace(/-/g, ''), `${slug}-1`])].filter(Boolean)) {
+        try {
+            const d = await gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`);
+            for (const t of d?.tracks || []) await addTrack(t);
+        } catch (e) {
+            /* next slug */
+        }
+    }
+    return out.slice(0, 40);
+}
+
 /** Gaana's song-page slug for a title, e.g. "Mah Ke Dekha Dem" -> "mah-ke-dekha-dem". */
 function gaanaSlug(s) {
     return String(s || '')
@@ -295,6 +374,23 @@ async function gaanaResolve(query, wantTitle, wantArtist, wantDur, wantAlbum) {
 
 export default async (request) => {
     const url = new URL(request.url);
+
+    // Gaana-direct search: search Gaana itself and return playable
+    // tracks (title, artist, album, cover, duration + fresh signed
+    // HLS URLs), so the player no longer needs an Octave/Deezer
+    // track first and then a match-by-title lookup at play time.
+    // Filtering: a track is kept only if its title contains every
+    // word of the query — Gaana's search is token-based and returns
+    // unrelated tracks ("Uska Hi Banana" for "Tum Hi Ho"). If no
+    // title matches, the query's song-page slug is tried directly
+    // (covers songs Gaana's search ranking buries, e.g. a query
+    // that is itself a song title).
+    if (url.pathname === '/octave/gaana-search') {
+        const q = url.searchParams.get('q') || '';
+        if (!q) return new Response('missing q', { status: 400 });
+        const tracks = await gaanaSearch(q);
+        return Response.json({ tracks }, { headers: { 'Cache-Control': 'no-store' } });
+    }
 
     // Gaana playback resolver: fresh signed HLS URL for a title+artist.
     // Never cached (the signature expires in ~4h).
