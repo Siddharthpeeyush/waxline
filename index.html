@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- waxline build 20261105-gaana-fetchfix -->
+<!-- waxline build 20261105-gaana-homefix -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -641,62 +641,68 @@ const withAlbumCover = (t, a) => mapTrack({ ...t, album: t.album || { id: a.id, 
 const Api = {
   live: () => !LS.get('demo', false),
   cache: new Map(),
-  invalidate(){ this.cache.clear(); try{ localStorage.removeItem('waxline.home'); }catch(e){} },
+  invalidate(){ this.cache.clear(); try{ localStorage.removeItem('waxline.home'); localStorage.removeItem('waxline.home.gaana'); }catch(e){} },
   streamUrl(t){ return t.stream; },
   async home(){
     if(!this.live()) return DEMO.home();
     // Home catalogue is Gaana's latest now (2026-11-05, user's
     // call): "Just Arrived" playlists + the first playlist's tracks
-    // as Top tracks. The cache key changed so a stale Octave home
-    // cached by the old build can't survive into the new one.
-    try{ localStorage.removeItem('waxline.home'); }catch(e){}
+    // as Top tracks. Cache key v2 (2026-11-05 homefix): the v1 key
+    // got poisoned — a Gaana home failure fell back to the old
+    // Octave home and that fallback was cached for an hour, so
+    // both phone and desktop kept showing the old home on every
+    // refresh without ever retrying Gaana. The old keys are
+    // deleted here so a poisoned cache can never survive a build.
+    try{ localStorage.removeItem('waxline.home'); localStorage.removeItem('waxline.home.gaana'); }catch(e){}
     try{
-      const raw = localStorage.getItem('waxline.home.gaana');
+      const raw = localStorage.getItem('waxline.home.gaana2');
       if(raw){
         const c = JSON.parse(raw);
         if(c && Date.now() - c.at < 3600000 && c.data) return c.data;
       }
     }catch(e){}
     let data = null;
-    try{
-      // Cache-buster on every Gaana fetch: Netlify's CDN was serving
-      // stale cached 404/empty responses for /octave/gaana and
-      // /octave/gaana-search even though the edge sets no-store —
-      // a fresh query string defeats the CDN cache key, and these
-      // URLs are meant to be fresh on every call anyway (signed
-      // HLS URLs expire in ~4h).
-      const g = await fetch('/octave/gaana-home?cb=' + Date.now()).then(r => r.ok ? r.json() : null);
-      if(g && g.topTracks && g.topTracks.length){
-        const toTrack = t => ({
-          id: t.id, title: t.title, artist: t.artist, artistId: '',
-          album: t.album, albumId: '', cover: t.cover, duration: t.duration,
-          stream: '', _gaana: t.gaana,
-        });
-        data = {
-          featured: g.featured,
-          newReleases: [],
-          artists: [],
-          playlists: (g.playlists || []).map(p => ({
-            id: p.id, title: p.name, curator: p.curator, cover: p.cover, trackCount: p.trackCount,
-          })),
-          topTracks: g.topTracks.map(toTrack),
-        };
-      }
-    }catch(e){ data = null; }
-    if(!data){
-      // Gaana home failed — fall back to the old Octave home rather
-      // than showing a broken home page.
-      const s = await this.search('top hits');
-      data = {
-        featured: s.albums[0] || null,
-        newReleases: s.albums.slice(0, 12),
-        artists: s.artists.slice(0, 12),
-        playlists: s.playlists.slice(0, 8),
-        topTracks: s.tracks.slice(0, 15),
-      };
+    // Gaana home via the edge is intermittent (topTracks sometimes
+    // comes back empty, then works on the next call), so retry once
+    // with a fresh cache-buster before ever falling back.
+    for(let attempt = 0; attempt < 2 && !data; attempt++){
+      try{
+        const g = await fetch('/octave/gaana-home?cb=' + Date.now()).then(r => r.ok ? r.json() : null);
+        if(g && g.topTracks && g.topTracks.length){
+          const toTrack = t => ({
+            id: t.id, title: t.title, artist: t.artist, artistId: '',
+            album: t.album, albumId: '', cover: t.cover, duration: t.duration,
+            stream: '', _gaana: t.gaana,
+          });
+          data = {
+            featured: g.featured,
+            newReleases: [],
+            artists: [],
+            playlists: (g.playlists || []).map(p => ({
+              id: p.id, title: p.name, curator: p.curator, cover: p.cover, trackCount: p.trackCount,
+            })),
+            topTracks: g.topTracks.map(toTrack),
+          };
+        }
+      }catch(e){ /* retry, then fallback below */ }
     }
-    try{ localStorage.setItem('waxline.home.gaana', JSON.stringify({ at: Date.now(), data })); }catch(e){}
-    return data;
+    if(data){
+      // Only a real Gaana home is cached. The fallback is NEVER
+      // cached — caching it is what made the old home stick for an
+      // hour on every device after a single Gaana failure.
+      try{ localStorage.setItem('waxline.home.gaana2', JSON.stringify({ at: Date.now(), data })); }catch(e){}
+      return data;
+    }
+    // Gaana home failed twice — fall back to the old Octave home
+    // rather than showing a broken home page, but do NOT cache it.
+    const s = await this.search('top hits');
+    return {
+      featured: s.albums[0] || null,
+      newReleases: s.albums.slice(0, 12),
+      artists: s.artists.slice(0, 12),
+      playlists: s.playlists.slice(0, 8),
+      topTracks: s.tracks.slice(0, 15),
+    };
   },
   async search(q, opts = {}){
     if(!this.live()) return DEMO.search(q);
@@ -2190,7 +2196,7 @@ paintMode(); paintModes(); paintQueue(); paintVolIcon(); sizeNp();
 route();
 bootIcons();
 requestAnimationFrame(raf);
-setTimeout(()=> toast(Api.live() ? 'Full tracks via YouTube' : 'Demo catalogue loaded'), 1200);
+setTimeout(()=> toast(Api.live() ? 'Full tracks via Gaana' : 'Demo catalogue loaded'), 1200);
 </script>
 </body>
 </html>
