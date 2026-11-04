@@ -252,8 +252,16 @@ async function gaanaSearch(q) {
             const cands = [];
             for (const d of details) {
                 for (const t of d?.tracks || []) {
+                    // Query words may name the artist too ("Tum Hi Ho
+                    // Arijit Singh") — require every word to appear in
+                    // the title OR the artist list combined, not in
+                    // the title alone, or artist-named queries return
+                    // nothing.
                     const titleTokens = gaanaTokens(t.track_title || '');
-                    const allWords = [...want].every((w) => titleTokens.has(w));
+                    const artistTokens = new Set(
+                        (t.artist || []).flatMap((a) => [...gaanaTokens(a.name || '')])
+                    );
+                    const allWords = [...want].every((w) => titleTokens.has(w) || artistTokens.has(w));
                     if (!allWords) continue;
                     const rank = gaanaNorm(t.track_title) === gaanaNorm(q) ? 0 : 1;
                     cands.push({ t, rank });
@@ -280,7 +288,106 @@ async function gaanaSearch(q) {
             /* next slug */
         }
     }
-    return out.slice(0, 40);
+    // 60, not 40: slug tracks are appended after search candidates,
+    // and cutting at 40 dropped exactly the direct-page recordings
+    // (Queen's Bohemian Rhapsody via "bohemianrhapsody") that the
+    // slug step exists to surface.
+    return out.slice(0, 60);
+}
+
+/** Build a Waxline-shaped track with attached Gaana HLS URLs from a
+ *  Gaana track object (songDetail / playlistDetail share this shape). */
+async function gaanaTrackFrom(t) {
+    if (!t || !t.seokey) return null;
+    const msg = t?.urls?.medium?.message;
+    if (!msg) return null;
+    const base = await gaanaDecrypt(msg);
+    if (!base || !base.startsWith('https://')) return null;
+    const artists = (t.artist || []).map((a) => a.name).filter(Boolean);
+    return {
+        id: 'ga' + t.seokey,
+        title: t.track_title || '',
+        artist: artists.join(', '),
+        album: t.album_title || '',
+        cover: t.artwork_web || t.artwork || t.atw || '',
+        duration: Number(t.duration) || 0,
+        seokey: t.seokey,
+        gaana: {
+            title: t.track_title || '',
+            artist: artists.join(', '),
+            duration: Number(t.duration) || 0,
+            seokey: t.seokey,
+            stream_url_64: base,
+            stream_url: base.includes('64.mp4') ? base.replace('64.mp4', '128.mp4') : base,
+            stream_url_320: base.includes('64.mp4') ? base.replace('64.mp4', '320.mp4') : base,
+            source: 'gaana',
+        },
+    };
+}
+
+async function gaanaPlaylist(seokey) {
+    try {
+        const d = await gaanaPost(`https://gaana.com/apiv2?type=playlistDetail&seokey=${encodeURIComponent(seokey)}`);
+        const tracks = [];
+        for (const t of d?.tracks || []) {
+            const wt = await gaanaTrackFrom(t);
+            if (wt) tracks.push(wt);
+        }
+        return {
+            id: 'ga-pl-' + seokey,
+            // PlaylistDetail puts the name/cover under "playlist",
+            // not at the top level — falling back to the seokey here
+            // used to show "gaana-dj-new-releases-hot-50-hindi" as
+            // the featured title on home.
+            name: d?.playlist?.title || seokey,
+            curator: 'Gaana',
+            cover: d?.playlist?.atw || tracks[0]?.cover || '',
+            trackCount: Number(d?.count) || tracks.length,
+            tracks,
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+async function gaanaHome() {
+    let playlists = [];
+    try {
+        const feed = await gaanaPost('https://apiv2.gaana.com/home/smartfeed/603');
+        playlists = (feed?.entities || [])
+            .filter((e) => e.entity_type === 'PL')
+            .map((e) => ({
+                id: 'ga-pl-' + e.seokey,
+                seokey: e.seokey,
+                name: e.name || '',
+                curator: 'Gaana',
+                cover: e.artwork_medium || e.artwork || '',
+                trackCount: 0,
+            }));
+    } catch (e) {
+        /* fall through: empty home, player falls back to Octave */
+    }
+    let topTracks = [];
+    let featured = null;
+    if (playlists.length) {
+        const first = await gaanaPlaylist(playlists[0].seokey);
+        if (first) {
+            playlists[0].trackCount = first.trackCount;
+            topTracks = first.tracks.slice(0, 15);
+            featured = {
+                id: first.id,
+                title: first.name,
+                artist: 'Gaana',
+                artistId: '',
+                genre: 'Latest',
+                year: '2026',
+                cat: 'Gaana · Just Arrived',
+                trackCount: first.trackCount,
+                cover: first.cover,
+            };
+        }
+    }
+    return { playlists, topTracks, featured };
 }
 
 /** Gaana's song-page slug for a title, e.g. "Mah Ke Dekha Dem" -> "mah-ke-dekha-dem". */
@@ -390,6 +497,24 @@ export default async (request) => {
         if (!q) return new Response('missing q', { status: 400 });
         const tracks = await gaanaSearch(q);
         return Response.json({ tracks }, { headers: { 'Cache-Control': 'no-store' } });
+    }
+
+    // Gaana home: "Just Arrived" (smartfeed 603) gives Gaana's own
+    // latest playlists; the first playlist's tracks are the latest
+    // songs, with stream URLs attached. Gaana's Trending/Popular
+    // smartfeeds return "All the data for this section got filtered"
+    // from server IPs, so Just Arrived + playlistDetail is the
+    // working latest-from-Gaana path.
+    if (url.pathname === '/octave/gaana-home') {
+        const home = await gaanaHome();
+        return Response.json(home, { headers: { 'Cache-Control': 'no-store' } });
+    }
+    if (url.pathname === '/octave/gaana-playlist') {
+        const seokey = url.searchParams.get('seokey') || '';
+        if (!seokey) return new Response('missing seokey', { status: 400 });
+        const pl = await gaanaPlaylist(seokey);
+        if (!pl) return new Response('no gaana playlist', { status: 404 });
+        return Response.json(pl, { headers: { 'Cache-Control': 'no-store' } });
     }
 
     // Gaana playback resolver: fresh signed HLS URL for a title+artist.
