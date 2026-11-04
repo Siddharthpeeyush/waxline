@@ -159,24 +159,8 @@ function gaanaScore(wantTitle, wantArtist, wantDur, cand) {
     return { total, titleScore, artistScore };
 }
 
-/** Resolve a title+artist to Gaana's best matching track + HLS stream URL. */
-async function gaanaResolve(query, wantTitle, wantArtist, wantDur) {
-    // Search by TITLE ONLY: Gaana's search degrades badly with
-    // "title artist" phrases (it returned unrelated tracks for
-    // "Kesariya Arijit Singh", but correct results for "Kesariya").
-    // The artist is used for scoring, not for searching.
-    const keyword = wantTitle || query;
-    const search = await gaanaPost(
-        `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(keyword)}`
-    );
-    const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean).slice(0, 8);
-    if (!seos.length) return null;
-    const details = await Promise.all(
-        seos.map((seo) =>
-            gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
-        )
-    );
-    let best = null;
+/** Score + decrypt a list of songDetail responses, keeping the best. */
+async function gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, best) {
     for (const d of details) {
         for (const t of d?.tracks || []) {
             const msg = t?.urls?.medium?.message;
@@ -208,6 +192,84 @@ async function gaanaResolve(query, wantTitle, wantArtist, wantDur) {
             }
         }
     }
+    return best;
+}
+
+/** Gaana's song-page slug for a title, e.g. "Mah Ke Dekha Dem" -> "mah-ke-dekha-dem". */
+function gaanaSlug(s) {
+    return String(s || '')
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+}
+
+/** Resolve a title+artist to Gaana's best matching track + HLS stream URL. */
+async function gaanaResolve(query, wantTitle, wantArtist, wantDur, wantAlbum) {
+    // Step 1 — search by TITLE ONLY: Gaana's search degrades badly with
+    // "title artist" phrases (it returned unrelated tracks for
+    // "Kesariya Arijit Singh", but correct results for "Kesariya").
+    // The artist is used for scoring, not for searching.
+    const keyword = wantTitle || query;
+    let best = null;
+    try {
+        const search = await gaanaPost(
+            `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(keyword)}`
+        );
+        const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean).slice(0, 16);
+        if (seos.length) {
+            const details = await Promise.all(
+                seos.map((seo) =>
+                    gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
+                )
+            );
+            best = await gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, best);
+        }
+    } catch (e) {
+        /* fall through to slug lookup */
+    }
+    // A near-perfect search hit (exact title + exact artist, duration
+    // within ~50s) is the right track — no need for more lookups.
+    if (best && best.score >= 140) return best;
+
+    // Step 2 — direct song-page slugs. Gaana's title search is a
+    // ranking, not an index: it buries real tracks (it never listed
+    // "Mah Ke Dekha Dem" at all), but the song page itself is just
+    // gaana.com/song/<slug>. Proven cases:
+    //   "mah-ke-dekha-dem-1"  -> Pawan Singh, 223s (the Waxline version;
+    //                            plain "mah-ke-dekha-dem" is a 217s cut)
+    //   "kesariya-from-brahmastra" -> Arijit Singh, 268s
+    //   "bohemianrhapsody"    -> Queen, Remastered 2011, 358s
+    // All candidates are scored the same way and the BEST wins, so a
+    // wrong-slug hit (e.g. "kesariya" -> Ustad Sultan Khan) is rejected
+    // by the exact-artist gate, never returned.
+    const titleSlug = gaanaSlug(wantTitle);
+    const albumSlug = gaanaSlug(wantAlbum);
+    const slugCandidates = [];
+    if (titleSlug) {
+        slugCandidates.push(titleSlug);
+        slugCandidates.push(titleSlug.replace(/-/g, ''));
+        slugCandidates.push(`${titleSlug}-1`);
+        if (albumSlug) {
+            slugCandidates.push(`${titleSlug}-from-${albumSlug}`);
+            slugCandidates.push(`${titleSlug}-from-${albumSlug}-1`);
+            slugCandidates.push(`${titleSlug}-${albumSlug}`);
+        }
+    }
+    const uniqueSlugs = [...new Set(slugCandidates)];
+    if (uniqueSlugs.length) {
+        try {
+            const details = await Promise.all(
+                uniqueSlugs.map((seo) =>
+                    gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
+                )
+            );
+            best = await gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, best);
+        } catch (e) {
+            /* slug lookup is best-effort */
+        }
+    }
     // Require a real title match, not just an artist coincidence.
     if (!best || best.score < 80) return null;
     return best;
@@ -224,7 +286,8 @@ export default async (request) => {
         const q = url.searchParams.get('q') || `${title} ${artist}`.trim();
         if (!q) return new Response('missing q', { status: 400 });
         const dur = Number(url.searchParams.get('dur') || 0) || 0;
-        const res = await gaanaResolve(q, title, artist, dur);
+        const album = url.searchParams.get('album') || '';
+        const res = await gaanaResolve(q, title, artist, dur, album);
         if (!res) return new Response('no gaana match', { status: 404 });
         return Response.json(res, { headers: { 'Cache-Control': 'no-store' } });
     }
