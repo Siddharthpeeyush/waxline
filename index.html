@@ -664,8 +664,9 @@ const Api = {
     try{ localStorage.setItem('waxline.home', JSON.stringify({ at: Date.now(), data })); }catch(e){}
     return data;
   },
-  async search(q){
+  async search(q, opts = {}){
     if(!this.live()) return DEMO.search(q);
+    const gaanaOnly = !!opts.gaanaOnly;
     const enc = encodeURIComponent(q);
     // Search Gaana DIRECTLY first: its tracks already carry fresh
     // signed HLS URLs, so tapping one plays that exact Gaana track
@@ -686,13 +687,24 @@ const Api = {
       album: t.album, albumId: '', cover: t.cover, duration: t.duration,
       stream: '', _gaana: t.gaana,
     }));
-    // Merge, don't replace: Gaana's own search ranking buries some
-    // real recordings (Arijit's Kesariya, Queen's Bohemian Rhapsody)
-    // that Octave's catalogue lists first. Gaana tracks play
-    // instantly (URLs already attached); Octave tracks that aren't
-    // already listed (same title + artist + duration within 5s)
-    // are appended and resolve at play time via the slug resolver.
+    // User's call (2026-11-05): search results must come from Gaana
+    // only — Octave/Deezer tracks in search were the problem, because
+    // a listed track that Gaana doesn't carry either fails to play
+    // or resolves to a different version. So for a user search,
+    // tracks are Gaana tracks only: every row carries a fresh signed
+    // Gaana HLS URL and plays its own recording directly. Octave
+    // albums/artists/playlists are dropped for user searches too,
+    // so nothing on the search page leads back to Octave. (Home
+    // still uses the merged path — it calls search without
+    // gaanaOnly — so its featured albums and top tracks keep
+    // working.)
     const octaveTracks = (tr.data || []).map(mapTrack);
+    if (gaanaOnly) {
+      return {
+        tracks: gaanaTracks,
+        albums: [], artists: [], playlists: [],
+      };
+    }
     const sameSong = (a, b) => a.title.toLowerCase() === b.title.toLowerCase()
       && a.artist.toLowerCase() === b.artist.toLowerCase()
       && Math.abs((a.duration || 0) - (b.duration || 0)) <= 5;
@@ -1627,7 +1639,7 @@ async function route(){
 
   try{
     if(view==='home'){ main.innerHTML = loading('home'); main.innerHTML = vHome(await Api.home()); }
-    else if(view==='search'){ main.innerHTML = vSearch(currentQ ? await Api.search(currentQ) : null, currentQ); }
+    else if(view==='search'){ main.innerHTML = vSearch(currentQ ? await Api.search(currentQ, { gaanaOnly: true }) : null, currentQ); }
     else if(view==='album'){ main.innerHTML = loading('album'); main.innerHTML = vAlbum(await Api.album(arg)); }
     else if(view==='artist'){ main.innerHTML = loading('artist'); main.innerHTML = vArtist(await Api.artist(arg)); }
     else if(view==='playlist'){ main.innerHTML = loading('playlist'); const p = await Api.playlist(arg);
