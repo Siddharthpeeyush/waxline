@@ -238,6 +238,21 @@ async function gaanaSearch(q) {
             },
         });
     };
+    // Slug candidates FIRST, before the search burst: the search
+    // burst itself can trip Gaana's rate limit, and then the slug
+    // lookup that would have saved the exact recording fails too.
+    // (Live proof: a Pyaar search returned only a Vikas Gupta track
+    // whose title contains the words, because the slug lookup ran
+    // after the burst and came back empty.)
+    const slugFirst = gaanaSlug(q);
+    for (const seo of [...new Set([slugFirst, slugFirst.replace(/-/g, ''), `${slugFirst}-1`])].filter(Boolean)) {
+        try {
+            const d = await gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`);
+            for (const t of d?.tracks || []) await addTrack(t);
+        } catch (e) {
+            /* next slug */
+        }
+    }
     try {
         const search = await gaanaPost(
             `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(q)}`
