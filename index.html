@@ -734,12 +734,22 @@ const Api = {
     // working.)
     const octaveTracks = (tr.data || []).map(mapTrack);
     if (gaanaOnly) {
-      // Edge search empty is usually Gaana rate-limiting the edge
-      // IP, not "no such song" — fall back to searching Gaana
-      // directly from this browser before showing an empty page.
+      // Edge search empty — or missing the exact-title track even
+      // though other word-matching tracks came back — is usually
+      // Gaana rate-limiting the edge IP, not "no such song" (live
+      // case: a Pyaar search returned only a Vikas Gupta track
+      // whose title contains the words). Fall back to searching
+      // Gaana directly from this browser and merge in any exact
+      // track the edge missed.
       let tracks = gaanaTracks;
-      if(!tracks.length){
-        try{ tracks = await gaanaSearchClient(q); }catch(e){ tracks = []; }
+      const hasExact = tracks.some(t => gaanaClientNorm(t.title) === gaanaClientNorm(q));
+      if(!tracks.length || !hasExact){
+        try{
+          const clientTracks = await gaanaSearchClient(q);
+          const seenIds = new Set(tracks.map(t => t.id));
+          for(const ct of clientTracks) if(!seenIds.has(ct.id)){ tracks.push(ct); seenIds.add(ct.id); }
+          tracks.sort((a, b) => (gaanaClientNorm(a.title) === gaanaClientNorm(q) ? 0 : 1) - (gaanaClientNorm(b.title) === gaanaClientNorm(q) ? 0 : 1));
+        }catch(e){ /* keep edge tracks */ }
       }
       return {
         tracks,
