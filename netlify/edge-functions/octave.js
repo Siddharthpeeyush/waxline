@@ -244,11 +244,7 @@ async function gaanaSearch(q) {
         );
         const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean);
         if (seos.length) {
-            const details = await Promise.all(
-                seos.map((seo) =>
-                    gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
-                )
-            );
+            const details = await gaanaDetailsBatched(seos, 10);
             const cands = [];
             for (const d of details) {
                 for (const t of d?.tracks || []) {
@@ -390,6 +386,25 @@ async function gaanaHome() {
     return { playlists, topTracks, featured };
 }
 
+/** songDetail for a list of seokeys, in small batches, NOT all at
+ *  once: firing 50–110 parallel POSTs at Gaana from a Netlify edge
+ *  IP gets the burst rate-limited by Akamai (live resolver then
+ *  returns 404 intermittently, while the same code succeeds from
+ *  the VM). Batches of 8 keep the edge IP under the limit. */
+async function gaanaDetailsBatched(seos, batchSize = 8) {
+    const out = [];
+    for (let i = 0; i < seos.length; i += batchSize) {
+        const chunk = seos.slice(i, i + batchSize);
+        const details = await Promise.all(
+            chunk.map((seo) =>
+                gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
+            )
+        );
+        out.push(...details);
+    }
+    return out;
+}
+
 /** Gaana's song-page slug for a title, e.g. "Mah Ke Dekha Dem" -> "mah-ke-dekha-dem". */
 function gaanaSlug(s) {
     return String(s || '')
@@ -402,52 +417,18 @@ function gaanaSlug(s) {
 
 /** Resolve a title+artist to Gaana's best matching track + HLS stream URL. */
 async function gaanaResolve(query, wantTitle, wantArtist, wantDur, wantAlbum) {
-    // Step 1 — search by TITLE ONLY, using ALL results, not just the
-    // top few: same-name versions live far down the ranking (the
-    // correct artist's cut is often at position 20+, while the most
-    // popular cut sits at the top). Every candidate is scored by
-    // exact artist + duration, so extra candidates can't steal the
-    // match — they only give the right version a chance to be found.
-    // Gaana's search degrades badly with "title artist" phrases for
-    // some songs, so that search runs as a second, separate pass and
-    // its candidates are scored the same way (garbage is rejected
-    // by the exact-artist gate, never returned).
-    const keyword = wantTitle || query;
-    let best = null;
-    for (const kw of [keyword, wantTitle && wantArtist ? `${wantTitle} ${wantArtist}` : null].filter(Boolean)) {
-        try {
-            const search = await gaanaPost(
-                `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(kw)}`
-            );
-            const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean);
-            if (seos.length) {
-                const details = await Promise.all(
-                    seos.map((seo) =>
-                        gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
-                    )
-                );
-                best = await gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, best);
-            }
-        } catch (e) {
-            /* fall through to the next pass */
-        }
-    }
-    // No early return here, on purpose: a good search hit (score 145,
-    // duration off by 25s) must not beat a slug hit that is the exact
-    // recording (score 150, duration exact). All passes run and the
-    // BEST score across every pass wins.
-
-    // Step 2 — direct song-page slugs. Gaana's title search is a
-    // ranking, not an index: it buries real tracks (it never listed
-    // "Mah Ke Dekha Dem" at all), but the song page itself is just
-    // gaana.com/song/<slug>. Proven cases:
-    //   "mah-ke-dekha-dem-1"  -> Pawan Singh, 223s (the Waxline version;
-    //                            plain "mah-ke-dekha-dem" is a 217s cut)
+    // Slugs FIRST, and a perfect slug hit returns immediately:
+    // 150 is the maximum possible score (exact title 100 + exact
+    // artist 50 + duration exact), so nothing a search pass could
+    // find can beat it — and skipping the search bursts entirely
+    // is what keeps the live resolver reliable (see batched
+    // details note above). Proven slug cases:
+    //   "mah-ke-dekha-dem-1"  -> Pawan Singh, 223s
     //   "kesariya-from-brahmastra" -> Arijit Singh, 268s
     //   "bohemianrhapsody"    -> Queen, Remastered 2011, 358s
-    // All candidates are scored the same way and the BEST wins, so a
-    // wrong-slug hit (e.g. "kesariya" -> Ustad Sultan Khan) is rejected
-    // by the exact-artist gate, never returned.
+    //   "pyaar-karte-ho-na"   -> Javed-Mohsin, 191s
+    // Wrong-slug hits are rejected by the exact-artist gate, never
+    // returned, so running slugs first cannot return a wrong track.
     const titleSlug = gaanaSlug(wantTitle);
     const albumSlug = gaanaSlug(wantAlbum);
     const slugCandidates = [];
@@ -461,18 +442,38 @@ async function gaanaResolve(query, wantTitle, wantArtist, wantDur, wantAlbum) {
             slugCandidates.push(`${titleSlug}-${albumSlug}`);
         }
     }
+    let best = null;
     const uniqueSlugs = [...new Set(slugCandidates)];
     if (uniqueSlugs.length) {
         try {
-            const details = await Promise.all(
-                uniqueSlugs.map((seo) =>
-                    gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)
-                )
-            );
+            const details = await gaanaDetailsBatched(uniqueSlugs);
             best = await gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, best);
         } catch (e) {
             /* slug lookup is best-effort */
         }
+    }
+    if (best && best.score >= 150) return best;
+    // Search passes, only when slugs didn't give a perfect hit:
+    // title-only first, then title+artist (Gaana's search degrades
+    // with "title artist" phrases for some songs, so both run and
+    // candidates are scored the same way). Limited to the first 20
+    // results per pass and batched, to stay under Akamai's burst
+    // limit from edge IPs.
+    const keyword = wantTitle || query;
+    for (const kw of [keyword, wantTitle && wantArtist ? `${wantTitle} ${wantArtist}` : null].filter(Boolean)) {
+        try {
+            const search = await gaanaPost(
+                `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(kw)}`
+            );
+            const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean).slice(0, 20);
+            if (seos.length) {
+                const details = await gaanaDetailsBatched(seos);
+                best = await gaanaBestFromDetails(details, wantTitle, wantArtist, wantDur, best);
+            }
+        } catch (e) {
+            /* fall through to the next pass */
+        }
+        if (best && best.score >= 150) return best;
     }
     // Require a real title match, not just an artist coincidence.
     if (!best || best.score < 80) return null;
