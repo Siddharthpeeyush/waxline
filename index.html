@@ -734,8 +734,15 @@ const Api = {
     // working.)
     const octaveTracks = (tr.data || []).map(mapTrack);
     if (gaanaOnly) {
+      // Edge search empty is usually Gaana rate-limiting the edge
+      // IP, not "no such song" — fall back to searching Gaana
+      // directly from this browser before showing an empty page.
+      let tracks = gaanaTracks;
+      if(!tracks.length){
+        try{ tracks = await gaanaSearchClient(q); }catch(e){ tracks = []; }
+      }
       return {
-        tracks: gaanaTracks,
+        tracks,
         albums: [], artists: [], playlists: [],
       };
     }
@@ -967,6 +974,84 @@ const GAANA_QS = ['64','128','320'];
 function gaanaQuality(){
   const q = String(LS.get('gaana_quality','128'));
   return GAANA_QS.includes(q) ? q : '128';
+}
+// Client-side Gaana search, used ONLY when the edge search returns
+// empty: Gaana's search endpoint intermittently rate-limits or
+// filters requests coming from Netlify's edge IPs, while the same
+// call from the user's own browser (Gaana sends
+// Access-Control-Allow-Origin: *) works. The browser calls apiv2
+// directly, decrypts the stream URL with WebCrypto (same AES key
+// GaanaPy publishes), and builds tracks in the same shape as the
+// edge search, so playback is identical.
+const gaanaClientNorm = s => String(s||'').toLowerCase().replace(/&/g,' and ').replace(/[^a-z0-9]+/g,' ').trim();
+const gaanaClientTokens = s => new Set(gaanaClientNorm(s).split(' ').filter(Boolean));
+const gaanaClientSlug = s => gaanaClientNorm(s).replace(/ /g,'-');
+async function gaanaClientDecrypt(message){
+  try{
+    const msg = String(message||'').trim();
+    const off = parseInt(msg[0], 10);
+    if(!Number.isFinite(off) || off < 0) return '';
+    const iv = new TextEncoder().encode(msg.slice(off, off+16));
+    const b64 = msg.slice(off+16);
+    const ct = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('gy1t#b@jl(b$wtme'), { name: 'AES-CBC' }, false, ['decrypt']);
+    const plain = await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, key, ct);
+    return new TextDecoder().decode(plain).replace(/\0+$/,'');
+  }catch(e){ return ''; }
+}
+async function gaanaClientPost(url){
+  try{
+    const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'a=1' });
+    if(!r.ok) return null;
+    return await r.json();
+  }catch(e){ return null; }
+}
+async function gaanaClientTrack(t){
+  if(!t || !t.seokey) return null;
+  const msg = t?.urls?.medium?.message;
+  if(!msg) return null;
+  const base = await gaanaClientDecrypt(msg);
+  if(!base || !base.startsWith('https://')) return null;
+  const artists = (t.artist || []).map(a => a.name).filter(Boolean);
+  return {
+    id: 'ga' + t.seokey, title: t.track_title || '', artist: artists.join(', '), artistId: '',
+    album: t.album_title || '', albumId: '', cover: t.artwork_web || t.artwork || '', duration: Number(t.duration) || 0,
+    stream: '', _gaana: {
+      title: t.track_title || '', artist: artists.join(', '), duration: Number(t.duration) || 0, seokey: t.seokey,
+      stream_url_64: base,
+      stream_url: base.includes('64.mp4') ? base.replace('64.mp4', '128.mp4') : base,
+      stream_url_320: base.includes('64.mp4') ? base.replace('64.mp4', '320.mp4') : base,
+      source: 'gaana',
+    },
+  };
+}
+async function gaanaSearchClient(q){
+  const want = gaanaClientTokens(q);
+  const out = [], seen = new Set();
+  const add = async t => {
+    if(!t || !t.seokey || seen.has(t.seokey)) return;
+    const wt = await gaanaClientTrack(t);
+    if(wt){ seen.add(t.seokey); out.push(wt); }
+  };
+  try{
+    const search = await gaanaClientPost(`https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(q)}`);
+    const seos = ((search?.gr?.[0]?.gd) || []).map(x => x?.seo).filter(Boolean);
+    for(let i = 0; i < seos.length; i += 10){
+      const details = await Promise.all(seos.slice(i, i+10).map(seo => gaanaClientPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)));
+      for(const d of details) for(const t of d?.tracks || []){
+        const tt = gaanaClientTokens(t.track_title || '');
+        const at = new Set((t.artist || []).flatMap(a => [...gaanaClientTokens(a.name || '')]));
+        if(![...want].every(w => tt.has(w) || at.has(w))) continue;
+        await add(t);
+      }
+    }
+  }catch(e){ /* fall through to slug lookup */ }
+  const slug = gaanaClientSlug(q);
+  for(const seo of [...new Set([slug, slug.replace(/-/g, ''), `${slug}-1`])].filter(Boolean)){
+    const d = await gaanaClientPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`);
+    for(const t of d?.tracks || []) await add(t);
+  }
+  return out.slice(0, 60);
 }
 function gaanaUrlFor(g, q){
   if(!g) return '';
