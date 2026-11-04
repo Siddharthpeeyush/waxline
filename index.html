@@ -1642,17 +1642,25 @@ function vHome(d){
     </div></div>
   </section>
   <div class="manifesto"><p>Every play is a first pressing.</p><span class="micro">WAXLINE — streaming from the wax</span></div>
-  ${Store.recent.length ? secHead('01','Continue listening') + trackRows(Store.recent.slice(0,6),'Recently played',{albumCol:false}) : ''}
-  ${d.newReleases.length ? secHead('02','New releases') + `<div class="shelf-row">${d.newReleases.map(albumCard).join('')}</div>` : ''}
-  ${d.artists.length ? secHead('03','Artists to know') + `<div class="shelf-row">${d.artists.map(artistCard).join('')}</div>` : ''}
-  ${secHead('04','Top tracks today') + `<div class="toplist">${d.topTracks.map((t,i)=>`
+  ${(()=>{ let n = 0; const num = () => String(++n).padStart(2,'0');
+    // "Continue listening" is the user's own history, not the
+    // catalogue — dedupe it (the same song played twice used to
+    // show twice) so it never looks like stale catalogue data.
+    const seenRecent = new Set();
+    const recent = Store.recent.filter(t => !seenRecent.has(t.id) && seenRecent.add(t.id)).slice(0,6);
+    return [
+      recent.length ? secHead(num(),'Continue listening') + trackRows(recent,'Recently played',{albumCol:false}) : '',
+      d.newReleases.length ? secHead(num(),'New releases') + `<div class="shelf-row">${d.newReleases.map(albumCard).join('')}</div>` : '',
+      d.artists.length ? secHead(num(),'Artists to know') + `<div class="shelf-row">${d.artists.map(artistCard).join('')}</div>` : '',
+      secHead(num(),'Top tracks today') + `<div class="toplist">${d.topTracks.map((t,i)=>`
     <div class="toprow" data-tid="${t.id}" data-play="tracks" data-tk2="${topKey}" data-idx="${i}">
       <span class="n">${String(i+1).padStart(2,'0')}</span>
       <div style="min-width:0"><div class="tt">${esc(t.title)}</div><div class="ta">${esc(t.artist)}</div></div>
       <span class="t-dur">${fmt(t.duration)}</span>
       <button class="t-more" data-more data-tk="${topKey}" data-i="${i}" aria-label="More"><i data-lucide="more-horizontal"></i></button>
-    </div>`).join('')}</div>`}
-  ${secHead('05','Playlists by Waxline') + `<div class="shelf-row">${d.playlists.map(plCard).join('')}</div>`}`;
+    </div>`).join('')}</div>`,
+      secHead(num(),'Playlists by Gaana') + `<div class="shelf-row">${d.playlists.map(plCard).join('')}</div>`,
+    ].join(''); })()}`;
 }
 function vSearch(d, q){
   if(!q){
