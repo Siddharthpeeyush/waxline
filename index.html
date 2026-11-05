@@ -770,9 +770,9 @@ const Api = {
       if(!tracks.length || !hasExact || tracks.length < 5){
         try{
           const clientTracks = dedupeTracks(await gaanaSearchClient(q));
-          const seen = new Set(tracks.map(t => `${gaanaClientNorm(t.title)}|${gaanaClientNorm(t.artist)}|${t.duration || 0}`));
+          const seen = new Set(tracks.map(dedupeKey));
           for(const ct of clientTracks){
-            const k = `${gaanaClientNorm(ct.title)}|${gaanaClientNorm(ct.artist)}|${ct.duration || 0}`;
+            const k = dedupeKey(ct);
             if(!seen.has(k)){ tracks.push(ct); seen.add(k); }
           }
           tracks.sort((a, b) => (gaanaClientNorm(a.title) === gaanaClientNorm(q) ? 0 : 1) - (gaanaClientNorm(b.title) === gaanaClientNorm(q) ? 0 : 1));
@@ -1074,10 +1074,15 @@ function gaanaQuality(){
 // page IDs (e.g. the same song listed from two albums, or a slug
 // hit duplicating a search hit). Key is title + artist + duration,
 // not the track id, because the id differs per Gaana page.
+// Duration is bucketed to the nearest 5s: the same recording
+// sometimes lists as 191s on one Gaana page and 192s on another,
+// and exact-duration dedupe let that pair through as a visible
+// duplicate (live: Pyaar Karte Ho Na 3:11 at both #01 and #02).
+const dedupeKey = t => `${gaanaClientNorm(t.title)}|${gaanaClientNorm(t.artist)}|${Math.round((t.duration || 0) / 5) * 5}`;
 const dedupeTracks = tracks => {
   const seen = new Set(); const out = [];
   for(const t of tracks || []){
-    const k = `${gaanaClientNorm(t.title)}|${gaanaClientNorm(t.artist)}|${t.duration || 0}`;
+    const k = dedupeKey(t);
     if(seen.has(k)) continue; seen.add(k); out.push(t);
   }
   return out;
@@ -1904,8 +1909,11 @@ async function route(){
       // Stale-search guard: typing fires a search per keystroke and
       // each one takes seconds, so an older, slower search must
       // never overwrite the results of the query the user actually
-      // typed last.
+      // typed last. Show a loading state immediately — before the
+      // fix, the old results just sat there with no indication a
+      // new search was running.
       const qAtStart = currentQ;
+      main.innerHTML = `<div class="page-head"><div><div class="kicker">SEARCH</div><h2>Searching for “${esc(qAtStart)}”…</h2></div></div><div class="micro" style="padding:18px 0">FETCHING — GAANA · RESULTS APPEAR AS THEY ARRIVE</div>`;
       const res = currentQ ? await Api.search(currentQ, { gaanaOnly: true }) : null;
       if(currentQ !== qAtStart) return;
       main.innerHTML = vSearch(res, currentQ);
