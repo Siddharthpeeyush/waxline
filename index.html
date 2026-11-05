@@ -805,7 +805,21 @@ const Api = {
             const m = cand.title.match(/^(.*?)\s*\(from\s+"?([^")]+)"?\)\s*$/i);
             const cleanTitle = m ? m[1].trim() : cand.title;
             const albumHint = m ? m[2].trim() : cand.album;
-            const already = tracks.some(t => gaanaClientNorm(t.title) === gaanaClientNorm(cleanTitle) && Math.abs((t.duration || 0) - (cand.duration || 0)) <= 5);
+            // Pin the top result: when the hint's recording is
+            // already listed, move it to the front instead of
+            // leaving its position to whichever source (slug or
+            // search) happened to answer first that run — live,
+            // Tum Hi Ho's top two swapped between identical runs
+            // (Gurbani vs Mithoon/Arijit) for exactly this reason.
+            // Match on title + duration + an artist-token overlap
+            // with the hint artist, so a same-duration cover
+            // (Aaman Trikha, also 4:21) is never pinned by mistake.
+            const hintArtistTokens = gaanaClientTokens(cand.artist || '');
+            const pinIdx = tracks.findIndex(t => gaanaClientNorm(t.title) === gaanaClientNorm(cleanTitle)
+              && Math.abs((t.duration || 0) - (cand.duration || 0)) <= 5
+              && [...gaanaClientTokens(t.artist || '')].some(w => hintArtistTokens.has(w)));
+            if(pinIdx > 0){ const [pinned] = tracks.splice(pinIdx, 1); tracks.unshift(pinned); }
+            const already = pinIdx >= 0;
             if(!already){
               const params = new URLSearchParams({ title: cleanTitle, artist: cand.artist, dur: String(cand.duration || ''), album: albumHint || '' });
               params.set('cb', String(Date.now()));
