@@ -245,35 +245,43 @@ async function gaanaSearch(q) {
     // whose title contains the words, because the slug lookup ran
     // after the burst and came back empty.)
     const slugFirst = gaanaSlug(q);
-    for (const seo of [...new Set([slugFirst, slugFirst.replace(/-/g, ''), `${slugFirst}-1`])].filter(Boolean)) {
+    const slugSeos = [...new Set([slugFirst, slugFirst.replace(/-/g, ''), `${slugFirst}-1`])].filter(Boolean);
+    // Slug lookups run in parallel (3 calls), not one-by-one: the
+    // old sequential loop added ~1.5s to every search on its own.
+    await Promise.all(slugSeos.map(async (seo) => {
         try {
             const d = await gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`);
             for (const t of d?.tracks || []) await addTrack(t);
         } catch (e) {
             /* next slug */
         }
-    }
+    }));
     try {
         const search = await gaanaPost(
             `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(q)}`
         );
-        const seos = ((search?.gr?.[0]?.gd) || []).map((x) => x?.seo).filter(Boolean);
+        // Pre-filter on the search listing itself (gd carries ti +
+        // sti artist string) BEFORE fetching songDetail: the old
+        // code fetched details for all 40–55 results, which took
+        // 5–6s and tripped Gaana's burst rate-limit from edge IPs
+        // (live: Tum Hi Ho 5.5s, Kesariya/Pyaar sometimes 0 tracks).
+        // Now only the ~5–20 candidates whose title/artist already
+        // match every query word get a songDetail call.
+        const gd = (search?.gr?.[0]?.gd) || [];
+        const seos = [];
+        for (const x of gd) {
+            const titleTokens = gaanaTokens(x?.ti || '');
+            const artistTokens = new Set([...gaanaTokens(String(x?.sti || '').replace(/,/g, ' '))]);
+            const allWords = [...want].every((w) => titleTokens.has(w) || artistTokens.has(w));
+            if (!allWords) continue;
+            if (x?.seo) seos.push(x.seo);
+            if (seos.length >= 20) break;
+        }
         if (seos.length) {
             const details = await gaanaDetailsBatched(seos, 10);
             const cands = [];
             for (const d of details) {
                 for (const t of d?.tracks || []) {
-                    // Query words may name the artist too ("Tum Hi Ho
-                    // Arijit Singh") — require every word to appear in
-                    // the title OR the artist list combined, not in
-                    // the title alone, or artist-named queries return
-                    // nothing.
-                    const titleTokens = gaanaTokens(t.track_title || '');
-                    const artistTokens = new Set(
-                        (t.artist || []).flatMap((a) => [...gaanaTokens(a.name || '')])
-                    );
-                    const allWords = [...want].every((w) => titleTokens.has(w) || artistTokens.has(w));
-                    if (!allWords) continue;
                     const rank = gaanaNorm(t.track_title) === gaanaNorm(q) ? 0 : 1;
                     cands.push({ t, rank });
                 }
@@ -284,21 +292,8 @@ async function gaanaSearch(q) {
     } catch (e) {
         /* fall through to slug lookup */
     }
-    // Always run the slug candidates too, and collect ALL of them:
-    // Gaana's search ranking buries the real recording (Queen's
-    // "Bohemian Rhapsody" lives at "bohemianrhapsody", Pawan Singh's
-    // "Mah Ke Dekha Dem" at "mah-ke-dekha-dem-1"), while the plain
-    // slug is a different cut. Stopping at the first slug hit would
-    // surface only the wrong cut.
-    const slug = gaanaSlug(q);
-    for (const seo of [...new Set([slug, slug.replace(/-/g, ''), `${slug}-1`])].filter(Boolean)) {
-        try {
-            const d = await gaanaPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`);
-            for (const t of d?.tracks || []) await addTrack(t);
-        } catch (e) {
-            /* next slug */
-        }
-    }
+    // (The slug candidates already ran first, in parallel, above —
+    // running them again here cost ~1.5s per search for nothing.)
     // 60, not 40: slug tracks are appended after search candidates,
     // and cutting at 40 dropped exactly the direct-page recordings
     // (Queen's Bohemian Rhapsody via "bohemianrhapsody") that the
