@@ -719,7 +719,12 @@ const Api = {
     // fetched 4 Octave searches in parallel and waited for all of
     // them (Octave search alone takes seconds) before returning,
     // even though every Octave result was then thrown away. That
-    // was most of why search felt slow.
+    // was most of why search felt slow. One Octave track search IS
+    // still started in parallel below, but only as a *hint* for
+    // recordings Gaana's search ranking buries (see below) — it
+    // never blocks the Gaana results, and no Octave track is ever
+    // shown.
+    const hintP = gaanaOnly ? oget(`/dz/search/track?q=${enc}&limit=5`).catch(() => ({ data: [] })) : null;
     const g = await fetch('/octave/gaana-search?q=' + enc + '&cb=' + Date.now()).then(r => r.ok ? r.json() : { tracks: [] }).catch(() => ({ tracks: [] }));
     let tr = { data: [] }, al = { data: [] }, ar = { data: [] }, pl = { data: [] };
     if(!gaanaOnly){
@@ -773,26 +778,43 @@ const Api = {
           tracks.sort((a, b) => (gaanaClientNorm(a.title) === gaanaClientNorm(q) ? 0 : 1) - (gaanaClientNorm(b.title) === gaanaClientNorm(q) ? 0 : 1));
         }catch(e){ /* keep edge tracks */ }
       }
-      // Still no exact-title track? Gaana's search ranking buries
-      // some real recordings entirely (Arijit's Kesariya is never
-      // listed for "Kesariya" — it lives only at the slug
-      // kesariya-from-brahmastra). Use Octave ONLY as a hint for
-      // the album/artist/duration, then resolve the exact Gaana
-      // recording through the slug resolver — the track shown is
-      // still Gaana's, never an Octave track.
-      if(!tracks.some(t => gaanaClientNorm(t.title) === gaanaClientNorm(q))){
+      // Buried-recording hint: Gaana's search ranking buries some
+      // real recordings entirely — Arijit's Kesariya is never
+      // listed for "Kesariya" (21 other Kesariya songs are, but not
+      // his), because it lives only at the slug
+      // kesariya-from-brahmastra. The old gate ("only when no
+      // exact-title track at all") never fired for it, since
+      // other Kesariya tracks DO have the exact title. So: take
+      // the Octave top hit (started in parallel above), strip a
+      // "(From "Album")" suffix from its title — Deezer puts the
+      // film in the title, e.g. 'Kesariya (From "Brahmastra")' —
+      // and if no Gaana result already has that title at that
+      // duration, resolve the exact Gaana recording through the
+      // slug resolver using the parsed album. The track shown is
+      // still Gaana's, never an Octave track; when the recording
+      // is already listed (Tum Hi Ho, Pyaar), no extra call runs.
+      if(hintP){
         try{
-          const hint = await oget(`/dz/search/track?q=${enc}&limit=5`).catch(() => ({ data: [] }));
-          const cand = (hint.data || []).map(mapTrack).find(t => gaanaClientNorm(t.title) === gaanaClientNorm(q));
+          const hint = await hintP;
+          const cand = (hint.data || []).map(mapTrack).find(t => {
+            const m = t.title.match(/^(.*?)\s*\(from\s+"?([^")]+)"?\)\s*$/i);
+            const clean = m ? m[1].trim() : t.title;
+            return gaanaClientNorm(clean) === gaanaClientNorm(q);
+          });
           if(cand){
-            const params = new URLSearchParams({ title: cand.title, artist: cand.artist, dur: String(cand.duration || ''), album: cand.album || '' });
-            params.set('cb', String(Date.now()));
-            const r = await fetch('/octave/gaana?' + params.toString());
-            if(r.ok){
-              const g = await r.json();
-              if(g && g.stream_url_64){
-                const resolved = { id: 'ga' + g.seokey, title: g.title, artist: g.artist, artistId: '', album: cand.album, albumId: '', cover: cand.cover || '', duration: g.duration, stream: '', _gaana: g };
-                tracks.unshift(resolved);
+            const m = cand.title.match(/^(.*?)\s*\(from\s+"?([^")]+)"?\)\s*$/i);
+            const cleanTitle = m ? m[1].trim() : cand.title;
+            const albumHint = m ? m[2].trim() : cand.album;
+            const already = tracks.some(t => gaanaClientNorm(t.title) === gaanaClientNorm(cleanTitle) && Math.abs((t.duration || 0) - (cand.duration || 0)) <= 5);
+            if(!already){
+              const params = new URLSearchParams({ title: cleanTitle, artist: cand.artist, dur: String(cand.duration || ''), album: albumHint || '' });
+              params.set('cb', String(Date.now()));
+              const r = await fetch('/octave/gaana?' + params.toString());
+              if(r.ok){
+                const gg = await r.json();
+                if(gg && gg.stream_url_64 && !tracks.some(t => t.id === 'ga' + gg.seokey)){
+                  tracks.unshift({ id: 'ga' + gg.seokey, title: gg.title, artist: gg.artist, artistId: '', album: albumHint, albumId: '', cover: cand.cover || '', duration: gg.duration, stream: '', _gaana: gg });
+                }
               }
             }
           }
