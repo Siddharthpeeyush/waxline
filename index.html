@@ -450,7 +450,7 @@ setTimeout(function(){
 <!-- ============ PLAYER BAR ============ -->
 <footer id="playerbar">
   <div class="pb-left">
-    <button class="pb-cover" id="pbCover" aria-label="Open now playing"><img id="pbImg" alt="" onerror="this.classList.add('dead')"></button>
+    <button class="pb-cover" id="pbCover" aria-label="Open now playing"><img id="pbImg" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" onerror="this.classList.add('dead')"></button>
     <div class="pb-meta"><a class="pb-title" id="pbTitle" href="#">Nothing on the platter</a><a class="pb-artist" id="pbArtist" href="#">Press play to start the press</a></div>
     <button class="icon-btn" data-act="like" aria-label="Like"><i data-lucide="heart"></i></button>
     <button class="icon-btn pb-expand" data-act="expand" aria-label="Now playing"><i data-lucide="chevron-up"></i></button>
@@ -493,7 +493,7 @@ setTimeout(function(){
     <span class="kicker" id="npKick">Now playing</span>
   </div>
   <div class="np-body">
-    <div class="np-art"><div class="cover" id="npCoverWrap"><img id="npImg" alt="" onerror="this.classList.add('dead')"><span class="vinyl"></span></div></div>
+    <div class="np-art"><div class="cover" id="npCoverWrap"><img id="npImg" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" onerror="this.classList.add('dead')"><span class="vinyl"></span></div></div>
     <div class="np-info">
       <div class="kicker" id="npMeta">—</div>
       <h1 class="np-title" id="npTitle">—</h1>
@@ -679,7 +679,7 @@ const Api = {
             newReleases: [],
             artists: [],
             playlists: (g.playlists || []).map(p => ({
-              id: p.id, title: p.name, curator: p.curator, cover: p.cover, trackCount: p.trackCount,
+              id: p.id, name: p.name, title: p.name, curator: p.curator, cover: p.cover, trackCount: p.trackCount,
             })),
             topTracks: g.topTracks.map(toTrack),
           };
@@ -747,7 +747,7 @@ const Api = {
       // whose title contains the words). Fall back to searching
       // Gaana directly from this browser and merge in any exact
       // track the edge missed.
-      let tracks = gaanaTracks;
+      let tracks = dedupeTracks(gaanaTracks);
       const hasExact = tracks.some(t => gaanaClientNorm(t.title) === gaanaClientNorm(q));
       if(!tracks.length || !hasExact){
         try{
@@ -808,19 +808,35 @@ const Api = {
     if(id.startsWith('upl')) return LocalPl.get(id);            // user playlists are local-first
     if(id.startsWith('ga-pl-')){
       // Gaana playlist (home "Just Arrived" shelf): tracks already
-      // carry signed Gaana HLS URLs.
+      // carry signed Gaana HLS URLs. Retry once, then fall back to
+      // fetching playlistDetail directly from this browser — the
+      // edge's playlistDetail intermittently returns empty tracks,
+      // which used to render a blank playlist page ("0 TRACKS").
       const seokey = id.slice('ga-pl-'.length);
-      const p = await fetch('/octave/gaana-playlist?seokey=' + encodeURIComponent(seokey) + '&cb=' + Date.now()).then(r => r.ok ? r.json() : null);
-      if(!p) throw new Error('Gaana playlist unavailable');
-      return {
-        id: p.id, title: p.name, curator: p.curator, description: 'Gaana · Just Arrived',
+      const toPl = p => ({
+        id: p.id, name: p.name, title: p.name, curator: p.curator, description: 'Gaana · Just Arrived',
         cover: p.cover, trackCount: p.trackCount,
         tracks: (p.tracks || []).map(t => ({
           id: t.id, title: t.title, artist: t.artist, artistId: '',
           album: t.album, albumId: '', cover: t.cover, duration: t.duration,
           stream: '', _gaana: t.gaana,
         })),
-      };
+      });
+      for(let attempt = 0; attempt < 2; attempt++){
+        const p = await fetch('/octave/gaana-playlist?seokey=' + encodeURIComponent(seokey) + '&cb=' + Date.now()).then(r => r.ok ? r.json() : null).catch(() => null);
+        if(p && (p.tracks || []).length) return toPl(p);
+      }
+      try{
+        const d = await gaanaClientPost(`https://gaana.com/apiv2?type=playlistDetail&seokey=${encodeURIComponent(seokey)}`);
+        const tracks = [];
+        for(const t of d?.tracks || []){ const wt = await gaanaClientTrack(t); if(wt) tracks.push(wt); }
+        if(d?.playlist?.title && tracks.length) return toPl({
+          id: 'ga-pl-' + seokey, name: d.playlist.title, curator: 'Gaana',
+          cover: d.playlist.atw || tracks[0]?.cover || '', trackCount: Number(d.count) || tracks.length,
+          tracks: tracks.map(t => ({ ...t, gaana: t._gaana })),
+        });
+      }catch(e){ /* fall through to the error below */ }
+      throw new Error('Gaana playlist unavailable');
     }
     if(!this.live()) return DEMO.playlist(id);
     const k = 'pl' + id;
@@ -991,6 +1007,18 @@ function gaanaQuality(){
   const q = String(LS.get('gaana_quality','128'));
   return GAANA_QS.includes(q) ? q : '128';
 }
+// Dedupe tracks that are the same recording under different Gaana
+// page IDs (e.g. the same song listed from two albums, or a slug
+// hit duplicating a search hit). Key is title + artist + duration,
+// not the track id, because the id differs per Gaana page.
+const dedupeTracks = tracks => {
+  const seen = new Set(); const out = [];
+  for(const t of tracks || []){
+    const k = `${gaanaClientNorm(t.title)}|${gaanaClientNorm(t.artist)}|${t.duration || 0}`;
+    if(seen.has(k)) continue; seen.add(k); out.push(t);
+  }
+  return out;
+};
 // Client-side Gaana search, used ONLY when the edge search returns
 // empty: Gaana's search endpoint intermittently rate-limits or
 // filters requests coming from Netlify's edge IPs, while the same
@@ -1485,12 +1513,12 @@ function paintPlay(){
 function paintTrack(){
   const t = Player.track;
   if(!t){ return; }
-  $('#pbImg').src = t.cover || ''; $('#pbImg').classList.remove('dead');
+  if(t.cover){ $('#pbImg').src = t.cover; $('#pbImg').classList.remove('dead'); }
   $('#pbTitle').textContent = t.title;
   $('#pbTitle').href = '#/album/' + t.albumId;
   $('#pbArtist').textContent = t.artist;
   $('#pbArtist').href = '#/artist/' + t.artistId;
-  $('#npImg').src = t.cover || ''; $('#npImg').classList.remove('dead');
+  if(t.cover){ $('#npImg').src = t.cover; $('#npImg').classList.remove('dead'); }
   $('#npTitle').textContent = t.title;
   $('#npArtistLine').innerHTML = `by <a href="#/artist/${t.artistId}">${esc(t.artist)}</a>`;
   $('#npAlbumLine').innerHTML = `${t.cat ? esc(t.cat)+' · ' : ''}<a href="#/album/${t.albumId}">${esc(t.album)}</a> · ${fmt(t.duration)}`;
@@ -1557,7 +1585,7 @@ function paintRows(){
 function paintMode(){
   const live = Api.live();
   $('#sbMode').classList.toggle('live', live);
-  $('#sbModeTxt').textContent = live ? 'Live — ' + cfg.base.replace(/^https?:\/\//,'').slice(0,22) : 'Demo catalogue';
+  $('#sbModeTxt').textContent = live ? 'Live — Gaana' : 'Demo catalogue';
 }
 function renderSidebarPls(){
   const mine = LocalPl.all;
@@ -1595,8 +1623,8 @@ const artistCard = a => `
 const plCard = p => `
   <div class="card" data-nav="#/playlist/${p.id}">
     <div class="cover"><img src="${esc(p.cover)}" alt="" loading="lazy" onerror="this.classList.add('dead')">
-      <button class="playfab" data-play="playlist" data-id="${p.id}" aria-label="Play ${esc(p.name)}"><i data-lucide="play"></i></button></div>
-    <div class="c-title">${esc(p.name)}</div><div class="c-sub">by ${esc(p.curator||'Waxline')}</div>
+      <button class="playfab" data-play="playlist" data-id="${p.id}" aria-label="Play ${esc(p.title || p.name || '')}"><i data-lucide="play"></i></button></div>
+    <div class="c-title">${esc(p.title || p.name || '')}</div><div class="c-sub">by ${esc(p.curator||'Gaana')}</div>
   </div>`;
 const secHead = (n, title) => `<div class="sec-head"><span class="n">${n}</span><h2>${title}</h2><span class="rule"></span></div>`;
 
@@ -1644,10 +1672,10 @@ function vHome(d){
   <div class="manifesto"><p>Every play is a first pressing.</p><span class="micro">WAXLINE — streaming from the wax</span></div>
   ${(()=>{ let n = 0; const num = () => String(++n).padStart(2,'0');
     // "Continue listening" is the user's own history, not the
-    // catalogue — dedupe it (the same song played twice used to
-    // show twice) so it never looks like stale catalogue data.
-    const seenRecent = new Set();
-    const recent = Store.recent.filter(t => !seenRecent.has(t.id) && seenRecent.add(t.id)).slice(0,6);
+    // catalogue — dedupe it by song (title + artist + duration),
+    // not by id: the same recording played from two Gaana pages
+    // has two different ids and used to show twice.
+    const recent = dedupeTracks(Store.recent).slice(0,6);
     return [
       recent.length ? secHead(num(),'Continue listening') + trackRows(recent,'Recently played',{albumCol:false}) : '',
       d.newReleases.length ? secHead(num(),'New releases') + `<div class="shelf-row">${d.newReleases.map(albumCard).join('')}</div>` : '',
@@ -1660,7 +1688,8 @@ function vHome(d){
       <button class="t-more" data-more data-tk="${topKey}" data-i="${i}" aria-label="More"><i data-lucide="more-horizontal"></i></button>
     </div>`).join('')}</div>`,
       secHead(num(),'Playlists by Gaana') + `<div class="shelf-row">${d.playlists.map(plCard).join('')}</div>`,
-    ].join(''); })()}`;
+    ].join(''); })()}
+  <div style="margin:34px 0 10px;padding-top:18px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><span class="micro">WAXLINE — streaming from the wax</span><span class="micro">Catalogue &amp; streams via Gaana · Full tracks, no previews</span></div>`;
 }
 function vSearch(d, q){
   if(!q){
@@ -1686,10 +1715,10 @@ function vSearch(d, q){
         <div class="meta">Track · ${top.artistId ? `<a href="#/artist/${top.artistId}">${esc(top.artist)}</a>` : esc(top.artist)} · ${fmt(top.duration)}</div>
         <div class="actions"><button class="pill" data-play="tracks" data-tk2="${regTracks(d.tracks)}" data-idx="0"><i data-lucide="play"></i>Play</button></div>
       </div></div>` : ''}
-    ${d.tracks.length ? secHead('T1','Tracks') + trackRows(d.tracks,'Search — '+q,{albumCol:false}) : ''}
-    ${d.albums.length ? secHead('T2','Albums') + `<div class="shelf-row">${d.albums.map(albumCard).join('')}</div>` : ''}
-    ${d.artists.length ? secHead('T3','Artists') + `<div class="shelf-row">${d.artists.map(artistCard).join('')}</div>` : ''}
-    ${d.playlists.length ? secHead('T4','Playlists') + `<div class="shelf-row">${d.playlists.map(plCard).join('')}</div>` : ''}
+    ${d.tracks.length ? secHead('01','Tracks') + trackRows(d.tracks,'Search — '+q,{albumCol:false}) : ''}
+    ${d.albums.length ? secHead('02','Albums') + `<div class="shelf-row">${d.albums.map(albumCard).join('')}</div>` : ''}
+    ${d.artists.length ? secHead('03','Artists') + `<div class="shelf-row">${d.artists.map(artistCard).join('')}</div>` : ''}
+    ${d.playlists.length ? secHead('04','Playlists') + `<div class="shelf-row">${d.playlists.map(plCard).join('')}</div>` : ''}
   </div>`;
 }
 function vAlbum(a){
@@ -1731,13 +1760,14 @@ function vArtist(ar){
 }
 function vPlaylist(p){
   const own = p.id.startsWith('upl');
+  const pName = p.title || p.name || '';
   const total = p.tracks.reduce((s,t)=>s+(t.duration||0),0);
   return `<div class="view">
     <div class="detail">
       <div class="cover"><img src="${esc(p.cover)}" alt="" onerror="this.classList.add('dead')"></div>
       <div>
-        <span class="kicker">Playlist — by ${esc(p.curator||'Waxline')}</span>
-        <h1>${esc(p.name)}</h1>
+        <span class="kicker">Playlist — by ${esc(p.curator||'Gaana')}</span>
+        <h1>${esc(pName)}</h1>
         <div class="meta">${p.trackCount} tracks · ${fmt(total)}${p.description?' — '+esc(p.description):''}</div>
         <div class="actions">
           <button class="pill" data-play="playlist" data-id="${p.id}" ${p.trackCount?'':'disabled style="opacity:.35"'}><i data-lucide="play"></i>Play</button>
@@ -1747,8 +1777,9 @@ function vPlaylist(p){
       </div>
     </div>
     <div style="height:26px"></div>
-    ${p.tracks.length ? trackRows(p.tracks, 'Playlist — ' + p.name, {albumCol:false})
-      : `<div class="empty"><div class="big">An empty sleeve.</div><span class="micro">Use the ⋯ menu on any track to add it here</span></div>`}
+    ${p.tracks.length ? trackRows(p.tracks, 'Playlist — ' + pName, {albumCol:false})
+      : own ? `<div class="empty"><div class="big">An empty sleeve.</div><span class="micro">Use the ⋯ menu on any track to add it here</span></div>`
+      : `<div class="empty"><div class="big">Gaana didn't send this playlist's tracks.</div><span class="micro">Reload the page — the tracks usually come through on the next try</span></div>`}
   </div>`;
 }
 function vLiked(){
