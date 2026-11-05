@@ -715,13 +715,21 @@ const Api = {
     // fallback when Gaana has no title match (e.g. songs Gaana's
     // search ranking buries — those still resolve via the slug
     // resolver at play time, as before).
-    const [g, tr, al, ar, pl] = await Promise.all([
-      fetch('/octave/gaana-search?q=' + enc + '&cb=' + Date.now()).then(r => r.ok ? r.json() : { tracks: [] }).catch(() => ({ tracks: [] })),
-      oget(`/dz/search/track?q=${enc}&limit=12`).catch(() => ({ data: [] })),
-      oget(`/dz/search/album?q=${enc}&limit=12`).catch(() => ({ data: [] })),
-      oget(`/dz/search/artist?q=${enc}&limit=12`).catch(() => ({ data: [] })),
-      oget(`/dz/search/playlist?q=${enc}&limit=12`).catch(() => ({ data: [] })),
-    ]);
+    // Gaana-only user search must NOT wait for Octave: the old code
+    // fetched 4 Octave searches in parallel and waited for all of
+    // them (Octave search alone takes seconds) before returning,
+    // even though every Octave result was then thrown away. That
+    // was most of why search felt slow.
+    const g = await fetch('/octave/gaana-search?q=' + enc + '&cb=' + Date.now()).then(r => r.ok ? r.json() : { tracks: [] }).catch(() => ({ tracks: [] }));
+    let tr = { data: [] }, al = { data: [] }, ar = { data: [] }, pl = { data: [] };
+    if(!gaanaOnly){
+      [tr, al, ar, pl] = await Promise.all([
+        oget(`/dz/search/track?q=${enc}&limit=12`).catch(() => ({ data: [] })),
+        oget(`/dz/search/album?q=${enc}&limit=12`).catch(() => ({ data: [] })),
+        oget(`/dz/search/artist?q=${enc}&limit=12`).catch(() => ({ data: [] })),
+        oget(`/dz/search/playlist?q=${enc}&limit=12`).catch(() => ({ data: [] })),
+      ]);
+    }
     const gaanaTracks = (g.tracks || []).map(t => ({
       id: t.id, title: t.title, artist: t.artist, artistId: '',
       album: t.album, albumId: '', cover: t.cover, duration: t.duration,
@@ -749,13 +757,46 @@ const Api = {
       // track the edge missed.
       let tracks = dedupeTracks(gaanaTracks);
       const hasExact = tracks.some(t => gaanaClientNorm(t.title) === gaanaClientNorm(q));
-      if(!tracks.length || !hasExact){
+      // Thin edge results are usually Gaana rate-limiting the edge
+      // IP, not "only 2 songs exist" — the browser's own Gaana
+      // search (different IP, no edge throttle) often fills in
+      // the missing versions. Merge it in whenever the edge gave
+      // fewer than 5 tracks or missed the exact title.
+      if(!tracks.length || !hasExact || tracks.length < 5){
         try{
-          const clientTracks = await gaanaSearchClient(q);
-          const seenIds = new Set(tracks.map(t => t.id));
-          for(const ct of clientTracks) if(!seenIds.has(ct.id)){ tracks.push(ct); seenIds.add(ct.id); }
+          const clientTracks = dedupeTracks(await gaanaSearchClient(q));
+          const seen = new Set(tracks.map(t => `${gaanaClientNorm(t.title)}|${gaanaClientNorm(t.artist)}|${t.duration || 0}`));
+          for(const ct of clientTracks){
+            const k = `${gaanaClientNorm(ct.title)}|${gaanaClientNorm(ct.artist)}|${ct.duration || 0}`;
+            if(!seen.has(k)){ tracks.push(ct); seen.add(k); }
+          }
           tracks.sort((a, b) => (gaanaClientNorm(a.title) === gaanaClientNorm(q) ? 0 : 1) - (gaanaClientNorm(b.title) === gaanaClientNorm(q) ? 0 : 1));
         }catch(e){ /* keep edge tracks */ }
+      }
+      // Still no exact-title track? Gaana's search ranking buries
+      // some real recordings entirely (Arijit's Kesariya is never
+      // listed for "Kesariya" — it lives only at the slug
+      // kesariya-from-brahmastra). Use Octave ONLY as a hint for
+      // the album/artist/duration, then resolve the exact Gaana
+      // recording through the slug resolver — the track shown is
+      // still Gaana's, never an Octave track.
+      if(!tracks.some(t => gaanaClientNorm(t.title) === gaanaClientNorm(q))){
+        try{
+          const hint = await oget(`/dz/search/track?q=${enc}&limit=5`).catch(() => ({ data: [] }));
+          const cand = (hint.data || []).map(mapTrack).find(t => gaanaClientNorm(t.title) === gaanaClientNorm(q));
+          if(cand){
+            const params = new URLSearchParams({ title: cand.title, artist: cand.artist, dur: String(cand.duration || ''), album: cand.album || '' });
+            params.set('cb', String(Date.now()));
+            const r = await fetch('/octave/gaana?' + params.toString());
+            if(r.ok){
+              const g = await r.json();
+              if(g && g.stream_url_64){
+                const resolved = { id: 'ga' + g.seokey, title: g.title, artist: g.artist, artistId: '', album: cand.album, albumId: '', cover: cand.cover || '', duration: g.duration, stream: '', _gaana: g };
+                tracks.unshift(resolved);
+              }
+            }
+          }
+        }catch(e){ /* keep Gaana tracks */ }
       }
       return {
         tracks,
@@ -1079,15 +1120,19 @@ async function gaanaSearchClient(q){
   };
   try{
     const search = await gaanaClientPost(`https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(q)}`);
-    const seos = ((search?.gr?.[0]?.gd) || []).map(x => x?.seo).filter(Boolean);
+    // Same pre-filter as the edge: only candidates whose title /
+    // artist already match every query word get a songDetail call.
+    const seos = [];
+    for(const x of (search?.gr?.[0]?.gd) || []){
+      const tt = gaanaClientTokens(x?.ti || '');
+      const at = new Set([...gaanaClientTokens(String(x?.sti || '').replace(/,/g, ' '))]);
+      if(![...want].every(w => tt.has(w) || at.has(w))) continue;
+      if(x?.seo) seos.push(x.seo);
+      if(seos.length >= 20) break;
+    }
     for(let i = 0; i < seos.length; i += 10){
       const details = await Promise.all(seos.slice(i, i+10).map(seo => gaanaClientPost(`https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seo)}`)));
-      for(const d of details) for(const t of d?.tracks || []){
-        const tt = gaanaClientTokens(t.track_title || '');
-        const at = new Set((t.artist || []).flatMap(a => [...gaanaClientTokens(a.name || '')]));
-        if(![...want].every(w => tt.has(w) || at.has(w))) continue;
-        await add(t);
-      }
+      for(const d of details) for(const t of d?.tracks || []) await add(t);
     }
   }catch(e){ /* fall through to slug lookup */ }
   const slug = gaanaClientSlug(q);
@@ -1833,7 +1878,16 @@ async function route(){
 
   try{
     if(view==='home'){ main.innerHTML = loading('home'); main.innerHTML = vHome(await Api.home()); }
-    else if(view==='search'){ main.innerHTML = vSearch(currentQ ? await Api.search(currentQ, { gaanaOnly: true }) : null, currentQ); }
+    else if(view==='search'){
+      // Stale-search guard: typing fires a search per keystroke and
+      // each one takes seconds, so an older, slower search must
+      // never overwrite the results of the query the user actually
+      // typed last.
+      const qAtStart = currentQ;
+      const res = currentQ ? await Api.search(currentQ, { gaanaOnly: true }) : null;
+      if(currentQ !== qAtStart) return;
+      main.innerHTML = vSearch(res, currentQ);
+    }
     else if(view==='album'){ main.innerHTML = loading('album'); main.innerHTML = vAlbum(await Api.album(arg)); }
     else if(view==='artist'){ main.innerHTML = loading('artist'); main.innerHTML = vArtist(await Api.artist(arg)); }
     else if(view==='playlist'){ main.innerHTML = loading('playlist'); const p = await Api.playlist(arg);
